@@ -586,10 +586,18 @@ function render(){
   }
 
   if(state.settings.maintenanceMode && !(u && u.role==='ADMIN') && route!=='/login' && route!=='/register'){
+    state._authRoute = null;
     renderMaintenance(); return;
   }
-  if(route==='/login') return renderLogin();
-  if(route==='/register') return renderRegister();
+  if(route==='/login'){
+    if(state._authRoute!=='/login'){ state._authRoute='/login'; renderLogin(); }
+    return;
+  }
+  if(route==='/register'){
+    if(state._authRoute!=='/register'){ state._authRoute='/register'; renderRegister(); }
+    return;
+  }
+  state._authRoute = null;
   if(!u){ if(route!=='/login') go('#/login'); return; }
 
   if(route.startsWith('/admin')){
