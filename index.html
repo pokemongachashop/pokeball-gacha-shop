@@ -457,18 +457,20 @@ async function doRegister(loginId, password, displayName){
   if(!password || password.length<4) throw new Error('비밀번호는 4자 이상이어야 합니다.');
   if(!displayName) throw new Error('닉네임을 입력해주세요.');
   const key = displayName.toLowerCase();
-  await reserveNickname(key, null).catch(e=>{
-    if(e.message==='DUP_NAME') throw new Error('이미 사용 중인 닉네임입니다.');
-    throw e;
-  });
   const email = loginId.toLowerCase()+'@pgs.local';
   let cred;
   try{
     cred = await createUserWithEmailAndPassword(auth, email, password);
   }catch(err){
-    await deleteDoc(doc(db,'usernames',key)).catch(()=>{});
     if(err.code==='auth/email-already-in-use') throw new Error('이미 사용 중인 아이디입니다.');
     throw new Error('가입 중 오류가 발생했습니다: '+err.message);
+  }
+  try{
+    await reserveNickname(key, cred.user.uid);
+  }catch(e){
+    await cred.user.delete().catch(()=>{});
+    if(e.message==='DUP_NAME') throw new Error('이미 사용 중인 닉네임입니다.');
+    throw e;
   }
   const isFirst = await checkUsersEmpty();
   const profile = {
@@ -477,7 +479,6 @@ async function doRegister(loginId, password, displayName){
     createdAt:serverTimestamp(), createdAtKST:kstNow(), updatedAt:serverTimestamp(), updatedAtKST:kstNow(), lastLoginAt:serverTimestamp()
   };
   await setDoc(doc(db,'users',cred.user.uid), profile);
-  await updateDoc(doc(db,'usernames',key), {uid:cred.user.uid});
 }
 async function doLogin(loginId, password){
   const email = (loginId||'').trim().toLowerCase()+'@pgs.local';
