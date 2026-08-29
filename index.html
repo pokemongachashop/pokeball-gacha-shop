@@ -152,9 +152,8 @@ input,select,textarea{font-family:inherit;}
 .pack-list{padding:4px 14px 6px;display:flex;flex-direction:column;gap:12px;}
 .pack-list-card{border:2px solid var(--line);border-radius:18px;overflow:hidden;background:var(--surface);cursor:pointer;}
 .pack-list-card.active{border-color:var(--gold-deep);box-shadow:0 0 0 3px rgba(242,169,0,.18);}
-.pack-list-card .pc-img{width:100%;max-height:110px;object-fit:cover;display:block;background:var(--surface-2);}
-.pack-list-card .pc-noimg{width:100%;height:70px;background:linear-gradient(135deg,var(--surface-2),var(--line));
-  display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:11px;}
+.pack-list-card .pc-img{width:100%;max-height:220px;object-fit:cover;display:block;background:var(--surface-2);}
+.pack-list-card .pc-noimg{width:100%;height:140px;background:linear-gradient(135deg,var(--surface-2),var(--line));
   display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:11px;}
 .pack-list-card .pc-body{padding:14px 16px 16px;}
 .pack-list-card .pc-name{font-size:16px;font-weight:800;margin-bottom:4px;}
@@ -575,9 +574,12 @@ function subscribeUserData(uidVal){
   state.unsub.push(onSnapshot(query(collection(db,'inventories',uidVal,'items'), orderBy('obtainedAt','desc')), snap=>{
     state.inventory = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
   }));
-  state.unsub.push(onSnapshot(query(collection(db,'drawLogs'), where('uid','==',uidVal), orderBy('createdAt','desc'), limit(100)), snap=>{
-    state.drawLogs = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
-  }, err=>{ console.warn('drawLogs index needed', err); }));
+  state.unsub.push(onSnapshot(query(collection(db,'drawLogs'), where('uid','==',uidVal)), snap=>{
+    state.drawLogs = snap.docs.map(d=>({id:d.id, ...d.data()}))
+      .sort((a,b)=>tsMillis(b.createdAt)-tsMillis(a.createdAt))
+      .slice(0,100);
+    render();
+  }, err=>{ console.warn('drawLogs listener error', err); }));
 }
 function subscribeAdminData(){
   state.unsub.push(onSnapshot(collection(db,'users'), snap=>{
@@ -1090,15 +1092,27 @@ window.sellItem = async (itemId)=>{
   }catch(e){ toast('판매 처리 중 오류가 발생했습니다.','err'); }
 };
 window.requestClaim = async (itemId)=>{
-  const item = getInvItem(itemId);
+  const itemRef = doc(db,'inventories',state.user.uid,'items',itemId);
+  const claimRef = doc(collection(db,'claimRequests'));
   try{
-    await updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'CLAIM_REQUESTED', claimRequestedAt:serverTimestamp()});
-    await addDoc(collection(db,'claimRequests'), {
-      uid: state.user.uid, itemId, name: item?item.name:'', rarity: item?item.rarity:'', imageUrl: item?(item.imageUrl||''):'',
-      status:'PENDING', claimRequestedAt: serverTimestamp(), claimRequestedAtKST: kstNow()
+    await runTransaction(db, async(tx)=>{
+      const snap = await tx.get(itemRef);
+      if(!snap.exists()) throw new Error('NOT_FOUND');
+      const data = snap.data();
+      if(data.status!=='ACTIVE') throw new Error('INVALID_STATUS');
+      tx.update(itemRef, {status:'CLAIM_REQUESTED', claimRequestedAt: serverTimestamp()});
+      tx.set(claimRef, {
+        uid: state.user.uid, itemId, name: data.name||'', rarity: data.rarity||'', imageUrl: data.imageUrl||'',
+        status:'PENDING', claimRequestedAt: serverTimestamp(), claimRequestedAtKST: kstNow()
+      });
     });
     toast('수령 신청이 접수되었습니다.','ok');
-  }catch(e){ toast('처리 실패','err'); }
+  }catch(e){
+    console.error(e);
+    if(e.message==='NOT_FOUND') toast('아이템을 찾을 수 없습니다.','err');
+    else if(e.message==='INVALID_STATUS') toast('이미 처리 중인 아이템입니다.','err');
+    else toast('처리 중 오류가 발생했습니다.','err');
+  }
 };
 window.cancelClaim = async (itemId)=>{
   try{
