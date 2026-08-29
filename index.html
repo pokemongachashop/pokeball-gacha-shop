@@ -330,7 +330,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, addDoc, collection, collectionGroup,
-  query, where, orderBy, limit, onSnapshot, runTransaction, serverTimestamp, getDocs
+  query, where, orderBy, limit, startAfter, onSnapshot, runTransaction, serverTimestamp, getDocs, writeBatch
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 const firebaseConfig = {
   apiKey: "AIzaSyDL7ux7RaDyStclEktgkeqwX_vKDBC0I-4",
@@ -570,9 +570,6 @@ function subscribeUserData(uidVal){
     if(!snap.exists()) return;
     state.user = {uid:snap.id, ...snap.data()};
     render();
-  }));
-  state.unsub.push(onSnapshot(query(collection(db,'inventories',uidVal,'items'), orderBy('obtainedAt','desc')), snap=>{
-    state.inventory = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
   }));
   state.unsub.push(onSnapshot(query(collection(db,'drawLogs'), where('uid','==',uidVal), limit(150)), snap=>{
     state.drawLogs = snap.docs.map(d=>({id:d.id, ...d.data()}))
@@ -1016,25 +1013,71 @@ function attachDragReveal(mask, onRevealed){
   }
 }
 
-/* ---------------- Inventory ---------------- */
+/* ---------------- Inventory (페이지네이션) ---------------- */
 let invFilter = {sort:'recent', rarity:'all', fav:false};
+let invPage = { pageSize:20, cursors:[null], pageIndex:0, hasNext:false, loading:false, initialized:false };
+let invLastRoute = null;
+window.addEventListener('hashchange', ()=>{
+  const r = currentRoute();
+  if(r==='/inventory' && invLastRoute!=='/inventory') resetInvPage();
+  invLastRoute = r;
+});
+function resetInvPage(){
+  invPage = { pageSize:20, cursors:[null], pageIndex:0, hasNext:false, loading:false, initialized:true };
+  loadInventoryPage(0);
+}
+function buildInventoryQuery(cursorDoc){
+  const base = collection(db,'inventories',state.user.uid,'items');
+  const clauses = [];
+  if(invFilter.rarity!=='all') clauses.push(where('rarity','==',invFilter.rarity));
+  if(invFilter.fav) clauses.push(where('isFavorite','==',true));
+  const canOrder = (invFilter.rarity==='all' && !invFilter.fav); // rarity/fav 필터 시 복합색인 없이 동작하도록 orderBy 생략
+  const parts = [base, ...clauses];
+  if(canOrder) parts.push(orderBy('obtainedAt','desc'));
+  if(cursorDoc) parts.push(startAfter(cursorDoc));
+  parts.push(limit(invPage.pageSize+1));
+  return query(...parts);
+}
+async function loadInventoryPage(pageIndex){
+  if(!state.user) return;
+  invPage.loading = true; render();
+  try{
+    const cursorDoc = invPage.cursors[pageIndex] || null;
+    const snap = await getDocs(buildInventoryQuery(cursorDoc));
+    let docs = snap.docs;
+    const hasNext = docs.length > invPage.pageSize;
+    if(hasNext) docs = docs.slice(0, invPage.pageSize);
+    state.inventory = docs.map(d=>({id:d.id, ...d.data()})).filter(i=>i.status==='ACTIVE' || i.status==='CLAIM_REQUESTED');
+    invPage.hasNext = hasNext;
+    invPage.pageIndex = pageIndex;
+    if(docs.length) invPage.cursors[pageIndex+1] = docs[docs.length-1];
+  }catch(e){
+    console.error('inventory load error', e);
+    toast('보관함을 불러오는 중 오류가 발생했습니다.','err');
+  }
+  invPage.loading = false; render();
+}
+function refreshInvPage(){ loadInventoryPage(invPage.pageIndex); }
+window.invNextPage = ()=>{ if(invPage.hasNext && !invPage.loading) loadInventoryPage(invPage.pageIndex+1); };
+window.invPrevPage = ()=>{ if(invPage.pageIndex>0 && !invPage.loading) loadInventoryPage(invPage.pageIndex-1); };
 function renderInventory(){
   const u = state.user;
-  let list = state.inventory.filter(i=>i.status==='ACTIVE' || i.status==='CLAIM_REQUESTED');
-  if(invFilter.rarity!=='all') list = list.filter(i=>i.rarity===invFilter.rarity);
-  if(invFilter.fav) list = list.filter(i=>i.isFavorite);
-  if(invFilter.sort==='recent') list = list.slice().sort((a,b)=>tsMillis(b.obtainedAt)-tsMillis(a.obtainedAt));
-  if(invFilter.sort==='rarity') list = list.slice().sort((a,b)=>rarityRank(b.rarity)-rarityRank(a.rarity));
-  if(invFilter.sort==='value') list = list.slice().sort((a,b)=>b.sellCoin-a.sellCoin);
+  if(!invPage.initialized){ invPage.initialized = true; loadInventoryPage(0); }
+  let list = state.inventory.slice();
+  if(invFilter.sort==='rarity') list.sort((a,b)=>rarityRank(b.rarity)-rarityRank(a.rarity));
+  else if(invFilter.sort==='value') list.sort((a,b)=>b.sellCoin-a.sellCoin);
+  else list.sort((a,b)=>tsMillis(b.obtainedAt)-tsMillis(a.obtainedAt));
 
   document.getElementById('app').innerHTML = `
     <div class="topbar"><div class="topbar-row"><button class="btn sm" onclick="go('#/home')">뒤로</button><div class="logo">보관함</div><div class="spacer"></div><div class="coin-pill">${fmtCoin(u.coin)}</div></div></div>
     <div class="inv-toolbar">
       <span class="chip ${invFilter.fav?'on':''}" onclick="toggleInvFav()">즐겨찾기</span>
       <span class="chip ${invFilter.rarity==='all'?'on':''}" onclick="setInvRarity('all')">전체</span>
-      <span class="chip ${invFilter.rarity==='UR'?'on':''}" onclick="setInvRarity('UR')">UR</span>
-      <span class="chip ${invFilter.rarity==='SSR'?'on':''}" onclick="setInvRarity('SSR')">SSR</span>
+      <span class="chip ${invFilter.rarity==='N'?'on':''}" onclick="setInvRarity('N')">N</span>
+      <span class="chip ${invFilter.rarity==='R'?'on':''}" onclick="setInvRarity('R')">R</span>
       <span class="chip ${invFilter.rarity==='SR'?'on':''}" onclick="setInvRarity('SR')">SR</span>
+      <span class="chip ${invFilter.rarity==='SSR'?'on':''}" onclick="setInvRarity('SSR')">SSR</span>
+      <span class="chip ${invFilter.rarity==='UR'?'on':''}" onclick="setInvRarity('UR')">UR</span>
     </div>
     <div class="inv-toolbar">
       <select id="invSortSel" style="background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:12px;">
@@ -1042,9 +1085,10 @@ function renderInventory(){
         <option value="rarity" ${invFilter.sort==='rarity'?'selected':''}>등급순</option>
         <option value="value" ${invFilter.sort==='value'?'selected':''}>판매가순</option>
       </select>
-      <span class="muted" style="align-self:center;">총 ${list.length}개</span>
+      <span class="muted" style="align-self:center;">이 페이지 ${list.length}개</span>
+      ${invFilter.rarity!=='all' ? `<button class="btn sm danger" onclick="deleteRarityCards()">${esc(invFilter.rarity)} 등급 전체 삭제</button>` : ''}
     </div>
-    ${list.length ? list.map(i=>`
+    ${invPage.loading ? '<div class="empty">불러오는 중...</div>' : (list.length ? list.map(i=>`
       <div class="inv-item">
         ${i.imageUrl ? `<img src="${esc(i.imageUrl)}">` : `<div class="ii-noimg"></div>`}
         <div class="ii-body">
@@ -1061,18 +1105,25 @@ function renderInventory(){
             ` : `<button class="btn sm" onclick="cancelClaim('${i.id}')">수령 신청 취소</button>`}
           </div>
         </div>
-      </div>`).join('') : '<div class="empty">보관함이 비어있습니다. 홈에서 가챠를 진행해보세요.</div>'}
+      </div>`).join('') : '<div class="empty">보관함이 비어있습니다. 홈에서 가챠를 진행해보세요.</div>')}
+    <div class="inv-toolbar" style="justify-content:center;align-items:center;">
+      <button class="btn sm" onclick="invPrevPage()" ${invPage.pageIndex===0||invPage.loading?'disabled':''}>이전</button>
+      <span class="muted" style="align-self:center;">${invPage.pageIndex+1} 페이지</span>
+      <button class="btn sm" onclick="invNextPage()" ${!invPage.hasNext||invPage.loading?'disabled':''}>다음</button>
+    </div>
     ${bottomNavHtml('inventory')}
   `;
   document.getElementById('invSortSel').onchange = (e)=>{ invFilter.sort=e.target.value; render(); };
 }
-window.toggleInvFav = ()=>{ invFilter.fav=!invFilter.fav; render(); };
-window.setInvRarity = (r)=>{ invFilter.rarity=r; render(); };
+window.toggleInvFav = ()=>{ invFilter.fav=!invFilter.fav; resetInvPage(); };
+window.setInvRarity = (r)=>{ invFilter.rarity=r; resetInvPage(); };
 window.toggleFav = (itemId)=>{ updateInvItem(itemId, {isFavorite: !getInvItem(itemId).isFavorite}); };
 window.toggleLock = (itemId)=>{ updateInvItem(itemId, {isLocked: !getInvItem(itemId).isLocked}); };
 function getInvItem(itemId){ return state.inventory.find(i=>i.id===itemId); }
 function updateInvItem(itemId, patch){
-  updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {...patch, isNew:false}).catch(e=>toast('처리 실패','err'));
+  updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {...patch, isNew:false})
+    .then(()=>refreshInvPage())
+    .catch(e=>toast('처리 실패','err'));
 }
 window.sellItem = async (itemId)=>{
   const item = getInvItem(itemId);
@@ -1089,6 +1140,7 @@ window.sellItem = async (itemId)=>{
         memo:`${item.name} 즉시판매`, createdAt:serverTimestamp(), createdAtKST:kstNow()});
     });
     toast(`${item.name} 판매 완료`, 'ok');
+    refreshInvPage();
   }catch(e){ toast('판매 처리 중 오류가 발생했습니다.','err'); }
 };
 window.requestClaim = async (itemId)=>{
@@ -1107,6 +1159,7 @@ window.requestClaim = async (itemId)=>{
       });
     });
     toast('수령 신청이 접수되었습니다.','ok');
+    refreshInvPage();
   }catch(e){
     console.error('requestClaim error', e);
     if(e.message==='NOT_FOUND') toast('아이템을 찾을 수 없습니다.','err');
@@ -1121,7 +1174,32 @@ window.cancelClaim = async (itemId)=>{
     const snap = await getDocs(query(collection(db,'claimRequests'), where('uid','==',state.user.uid), where('itemId','==',itemId), where('status','==','PENDING')));
     await Promise.all(snap.docs.map(d=>deleteDoc(doc(db,'claimRequests',d.id))));
     toast('수령 신청을 취소했습니다.','ok');
+    refreshInvPage();
   }catch(e){ toast('처리 실패','err'); }
+};
+window.deleteRarityCards = async function(){
+  if(invFilter.rarity==='all') return toast('삭제할 등급을 선택해주세요.','err');
+  const rarity = invFilter.rarity;
+  if(!confirm(`${rarityLabel(rarity)} 등급 카드를 보관함에서 모두 삭제할까요? (잠금된 카드는 제외됩니다) 되돌릴 수 없습니다.`)) return;
+  try{
+    const snap = await getDocs(query(collection(db,'inventories',state.user.uid,'items'),
+      where('rarity','==',rarity), where('status','==','ACTIVE')));
+    const targets = snap.docs.filter(d=>!d.data().isLocked);
+    if(targets.length===0){ toast('삭제할 카드가 없습니다.','err'); return; }
+    let batch = writeBatch(db);
+    let count = 0;
+    for(const d of targets){
+      batch.update(d.ref, {status:'DELETED', deletedAt: serverTimestamp()});
+      count++;
+      if(count % 400 === 0){ await batch.commit(); batch = writeBatch(db); }
+    }
+    await batch.commit();
+    toast(`${count}개 카드를 삭제했습니다.`,'ok');
+    resetInvPage();
+  }catch(e){
+    console.error('deleteRarityCards error', e);
+    toast('삭제 중 오류가 발생했습니다.','err');
+  }
 };
 
 /* ---------------- Draw history ---------------- */
