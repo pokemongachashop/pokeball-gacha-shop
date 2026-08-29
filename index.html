@@ -180,17 +180,30 @@ input,select,textarea{font-family:inherit;}
 .rc-mask.settling{transition:transform .28s cubic-bezier(.2,.8,.3,1);}
 .rc-mask.gone{display:none;}
 .reveal-cell.aurora-SSR .reveal-cell-clip{border-color:transparent;}
-.reveal-cell.aurora-SSR::before{content:'';position:absolute;inset:-3px;border-radius:17px;z-index:0;
-  background:conic-gradient(from 0deg, var(--r-ssr), #fff, var(--r-ssr), #C9A6F2, var(--r-ssr));
-  animation:aurora-spin 2.6s linear infinite;filter:blur(2px);}
+.reveal-cell.aurora-SSR::before,.reveal-cell.aurora-SSR::after{content:'';position:absolute;top:10%;bottom:10%;width:36%;z-index:0;
+  border-radius:50%;background:radial-gradient(closest-side, var(--r-ssr), rgba(255,255,255,.4) 55%, transparent 78%);
+  filter:blur(9px);animation:aurora-flame 1.7s ease-in-out infinite alternate;}
+.reveal-cell.aurora-SSR::before{left:-15%;animation-delay:0s;}
+.reveal-cell.aurora-SSR::after{right:-15%;animation-delay:.4s;}
 .reveal-cell.aurora-UR .reveal-cell-clip{border-color:transparent;}
-.reveal-cell.aurora-UR::before{content:'';position:absolute;inset:-3px;border-radius:17px;z-index:0;
-  background:conic-gradient(from 0deg, var(--r-ur1), var(--r-ur2), #fff, var(--r-ur1), var(--r-ur2));
-  animation:aurora-spin 1.8s linear infinite;filter:blur(2px);}
-@keyframes aurora-spin{to{transform:rotate(360deg);}}
-.reveal-cell.revealed::before{display:none;}
+.reveal-cell.aurora-UR::before,.reveal-cell.aurora-UR::after{content:'';position:absolute;top:8%;bottom:8%;width:40%;z-index:0;
+  border-radius:50%;background:radial-gradient(closest-side, var(--r-ur1), var(--r-ur2) 55%, transparent 80%);
+  filter:blur(10px);animation:aurora-flame 1.25s ease-in-out infinite alternate;}
+.reveal-cell.aurora-UR::before{left:-17%;animation-delay:0s;}
+.reveal-cell.aurora-UR::after{right:-17%;animation-delay:.35s;}
+@keyframes aurora-flame{
+  0%{opacity:.5;transform:scaleY(.86) scaleX(.88);}
+  50%{opacity:.92;transform:scaleY(1.08) scaleX(1.08);}
+  100%{opacity:.6;transform:scaleY(.94) scaleX(.92);}
+}
+.reveal-cell.revealed::before,.reveal-cell.revealed::after{display:none;}
 .rc-name{font-size:10.5px;padding:5px 6px;font-weight:700;text-align:center;}
 .reveal-actions{display:flex;gap:8px;margin-top:6px;}
+@media(max-width:480px){
+  .reveal-grid{grid-template-columns:repeat(4,1fr);gap:7px;}
+  .rc-name{font-size:8.5px;padding:3px 3px;}
+  .rc-mask-hint{font-size:8px;padding:3px 6px;}
+}
 
 /* ---------- inventory ---------- */
 .inv-toolbar{display:flex;gap:8px;padding:12px 14px 0;flex-wrap:wrap;}
@@ -232,6 +245,7 @@ input,select,textarea{font-family:inherit;}
 .admin-link{display:block;padding:10px 12px;border-radius:10px;font-size:13px;font-weight:700;color:var(--text-dim);margin-bottom:2px;}
 .admin-link.on{background:var(--surface-2);color:var(--text);}
 .admin-main{flex:1;padding:18px 20px;min-width:0;}
+.admin-topbar-btn{display:flex;justify-content:flex-end;margin-bottom:10px;}
 .admin-topbar{display:flex;align-items:center;margin-bottom:16px;gap:10px;flex-wrap:wrap;}
 .admin-topbar h1{font-size:18px;margin:0;flex:1;}
 .stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:18px;}
@@ -780,58 +794,66 @@ window.doDraw = async function(count){
   const candidateIds = state.products.filter(p=>p.cardPackId===packId && p.status==='ACTIVE').map(p=>p.id);
   if(candidateIds.length===0) return toast('뽑을 수 있는 상품이 없습니다.','err');
 
-  try{
-    const drawn = await runTransaction(db, async (tx)=>{
-      const userRef = doc(db,'users',u.uid);
-      const userSnap = await tx.get(userRef);
-      const userData = userSnap.data();
-      if(!userData || userData.coin < price) throw new Error('INSUFFICIENT_COIN');
-      const productRefs = candidateIds.map(id=>doc(db,'products',id));
-      const productDocs = await Promise.all(productRefs.map(r=>tx.get(r)));
-      let pool = productDocs.filter(d=>d.exists()).map(d=>({id:d.id, ...d.data()}))
-        .filter(p=>p.status==='ACTIVE' && !p.forceSoldOut && p.currentStock>0);
-      const results = [];
-      const stockDelta = {};
-      for(let i=0;i<count;i++){
-        if(pool.length===0) break;
-        const totalWeight = pool.reduce((s,p)=>s+Number(p.probability),0) || 1;
-        let r = Math.random()*totalWeight;
-        let picked = pool[pool.length-1];
-        for(const p of pool){ if(r < p.probability){ picked=p; break; } r -= p.probability; }
-        picked.currentStock -= 1;
-        stockDelta[picked.id] = (stockDelta[picked.id]||0)+1;
-        results.push({...picked});
-        if(picked.currentStock<=0) pool = pool.filter(p=>p.id!==picked.id);
-      }
-      if(results.length===0) throw new Error('NO_STOCK');
-      Object.keys(stockDelta).forEach(pid=>{
-        const before = productDocs.find(d=>d.id===pid).data().currentStock;
-        tx.update(doc(db,'products',pid), {currentStock: before - stockDelta[pid], updatedAt: serverTimestamp()});
+  const maxAttempts = 4;
+  let lastErr = null;
+  for(let attempt=0; attempt<maxAttempts; attempt++){
+    try{
+      const drawn = await runTransaction(db, async (tx)=>{
+        const userRef = doc(db,'users',u.uid);
+        const userSnap = await tx.get(userRef);
+        const userData = userSnap.data();
+        if(!userData || userData.coin < price) throw new Error('INSUFFICIENT_COIN');
+        const productRefs = candidateIds.map(id=>doc(db,'products',id));
+        const productDocs = await Promise.all(productRefs.map(r=>tx.get(r)));
+        let pool = productDocs.filter(d=>d.exists()).map(d=>({id:d.id, ...d.data()}))
+          .filter(p=>p.status==='ACTIVE' && !p.forceSoldOut && p.currentStock>0);
+        const results = [];
+        const stockDelta = {};
+        for(let i=0;i<count;i++){
+          if(pool.length===0) break;
+          const totalWeight = pool.reduce((s,p)=>s+Number(p.probability),0) || 1;
+          let r = Math.random()*totalWeight;
+          let picked = pool[pool.length-1];
+          for(const p of pool){ if(r < p.probability){ picked=p; break; } r -= p.probability; }
+          picked.currentStock -= 1;
+          stockDelta[picked.id] = (stockDelta[picked.id]||0)+1;
+          results.push({...picked});
+          if(picked.currentStock<=0) pool = pool.filter(p=>p.id!==picked.id);
+        }
+        if(results.length===0) throw new Error('NO_STOCK');
+        Object.keys(stockDelta).forEach(pid=>{
+          const before = productDocs.find(d=>d.id===pid).data().currentStock;
+          tx.update(doc(db,'products',pid), {currentStock: before - stockDelta[pid], updatedAt: serverTimestamp()});
+        });
+        const newCoin = userData.coin - price;
+        tx.update(userRef, {coin:newCoin, updatedAt:serverTimestamp()});
+        const ledgerRef = doc(collection(db,'coinLedgers'));
+        tx.set(ledgerRef, {uid:u.uid, type:'DRAW', beforeCoin:userData.coin, changeCoin:-price, afterCoin:newCoin,
+          memo:`${pack.name} ${count}회 뽑기`, createdAt:serverTimestamp(), createdAtKST:kstNow()});
+        results.forEach(rItem=>{
+          const itemRef = doc(collection(db,'inventories',u.uid,'items'));
+          tx.set(itemRef, {productId:rItem.id, cardPackId:packId, name:rItem.name, imageUrl:rItem.imageUrl||'', rarity:rItem.rarity,
+            sellCoin:rItem.sellCoin, isFavorite:false, isLocked:false, isNew:true, status:'ACTIVE',
+            obtainedAt: serverTimestamp(), obtainedAtKST: kstNow()});
+        });
+        const logRef = doc(collection(db,'drawLogs'));
+        tx.set(logRef, {uid:u.uid, displayName:userData.displayName, cardPackId:packId, cardPackName:pack.name,
+          drawType:`${count}연속`, results:results.map(rr=>({productId:rr.id,name:rr.name,rarity:rr.rarity,imageUrl:rr.imageUrl||''})),
+          usedCoin:price, createdAt:serverTimestamp(), createdAtKST:kstNow()});
+        return results;
       });
-      const newCoin = userData.coin - price;
-      tx.update(userRef, {coin:newCoin, updatedAt:serverTimestamp()});
-      const ledgerRef = doc(collection(db,'coinLedgers'));
-      tx.set(ledgerRef, {uid:u.uid, type:'DRAW', beforeCoin:userData.coin, changeCoin:-price, afterCoin:newCoin,
-        memo:`${pack.name} ${count}회 뽑기`, createdAt:serverTimestamp(), createdAtKST:kstNow()});
-      results.forEach(rItem=>{
-        const itemRef = doc(collection(db,'inventories',u.uid,'items'));
-        tx.set(itemRef, {productId:rItem.id, cardPackId:packId, name:rItem.name, imageUrl:rItem.imageUrl||'', rarity:rItem.rarity,
-          sellCoin:rItem.sellCoin, isFavorite:false, isLocked:false, isNew:true, status:'ACTIVE',
-          obtainedAt: serverTimestamp(), obtainedAtKST: kstNow()});
-      });
-      const logRef = doc(collection(db,'drawLogs'));
-      tx.set(logRef, {uid:u.uid, displayName:userData.displayName, cardPackId:packId, cardPackName:pack.name,
-        drawType:`${count}연속`, results:results.map(rr=>({productId:rr.id,name:rr.name,rarity:rr.rarity,imageUrl:rr.imageUrl||''})),
-        usedCoin:price, createdAt:serverTimestamp(), createdAtKST:kstNow()});
-      return results;
-    });
-    showDrawReveal(drawn, pack);
-  }catch(e){
-    console.error(e);
-    if(e.message==='INSUFFICIENT_COIN') toast('코인이 부족합니다.','err');
-    else if(e.message==='NO_STOCK') toast('재고가 부족합니다.','err');
-    else toast('뽑기 처리 중 오류가 발생했습니다.','err');
+      showDrawReveal(drawn, pack);
+      return;
+    }catch(e){
+      lastErr = e;
+      if(e.message==='INSUFFICIENT_COIN' || e.message==='NO_STOCK') break;
+      await new Promise(res=>setTimeout(res, 250 + attempt*250));
+    }
   }
+  console.error(lastErr);
+  if(lastErr && lastErr.message==='INSUFFICIENT_COIN') toast('코인이 부족합니다.','err');
+  else if(lastErr && lastErr.message==='NO_STOCK') toast('재고가 부족합니다.','err');
+  else toast('다른 유저와 요청이 겹쳐 처리가 지연되었습니다. 다시 시도해주세요.','err');
 };
 
 /* ---------------- Draw reveal (drag-to-uncover mask) ---------------- */
@@ -1124,6 +1146,7 @@ function renderAdmin(route){
         </div>
       </div>
       <div class="admin-main">
+        <div class="admin-topbar-btn"><a class="btn sm" href="#/home">메인 화면으로</a></div>
         <div class="mobile-admin-nav">${navHtml}</div>
         <div id="adminContent"></div>
       </div>
@@ -1178,12 +1201,31 @@ function adminUsers(c){
         <td>${esc(u.displayName)}</td><td>${esc(u.loginId)}</td>
         <td>${u.role==='ADMIN'?'<span class="badge UR">ADMIN</span>':'<span class="badge N">USER</span>'}</td>
         <td>${fmtCoin(u.coin)}</td><td>${kst(u.createdAt)}</td>
-        <td><button class="btn sm" onclick="openCoinAdjust('${u.uid}')">코인 충전/차감</button></td>
+        <td>
+          <button class="btn sm" onclick="openCoinAdjust('${u.uid}')">코인 충전/차감</button>
+          ${u.role==='ADMIN'
+            ? (state.user && state.user.uid===u.uid ? '' : `<button class="btn sm danger" onclick="toggleAdminRole('${u.uid}', false)">관리자 해제</button>`)
+            : `<button class="btn sm" onclick="toggleAdminRole('${u.uid}', true)">관리자로 지정</button>`}
+        </td>
       </tr>`).join('') || '<tr><td colspan="6" class="muted">사용자 없음</td></tr>'}
     </tbody></table></div>
   `;
   document.getElementById('adminUserSearch').oninput = (e)=>{ window._adminUserQ = e.target.value; adminUsers(document.getElementById('adminContent')); };
 }
+window.toggleAdminRole = async function(userUid, makeAdmin){
+  const u = state.users[userUid];
+  if(!u) return;
+  const label = makeAdmin ? '관리자로 지정' : '관리자 권한 해제';
+  if(!confirm(`${esc(u.displayName)} 님을 ${label}하시겠습니까?`)) return;
+  const newRole = makeAdmin ? 'ADMIN' : 'USER';
+  try{
+    await updateDoc(doc(db,'users',userUid), {role:newRole, updatedAt:serverTimestamp(), updatedAtKST:kstNow()});
+    await addAuditLog(makeAdmin?'관리자 지정':'관리자 해제', userUid, {role:u.role}, {role:newRole});
+    toast(`${label} 완료`,'ok');
+  }catch(e){
+    toast('처리 중 오류가 발생했습니다.','err');
+  }
+};
 window.openCoinAdjust = function(userUid){
   const u = state.users[userUid];
   openModal(`
@@ -1630,11 +1672,21 @@ function downloadLogsCsv(logs){
 /* ---------- Admins list ---------- */
 function adminAdminsList(c){
   const admins = state.admins;
+  const nonAdmins = Object.values(state.users).filter(u=>u.role!=='ADMIN');
   const selUid = window._adminSelUid || (admins[0] && admins[0].uid);
   window._adminSelUid = selUid;
   const logs = state.auditLogs.filter(l=>l.adminUid===selUid).slice(0,100);
   c.innerHTML = `
     <div class="admin-topbar"><h1>관리자 목록</h1></div>
+    <div class="field-row" style="display:flex;gap:8px;align-items:flex-end;margin-bottom:16px;">
+      <div class="field" style="flex:1;margin-bottom:0;">
+        <label>관리자로 지정할 사용자</label>
+        <select id="adminAddSel">
+          ${nonAdmins.length ? nonAdmins.map(u=>`<option value="${u.uid}">${esc(u.displayName)} (${esc(u.loginId)})</option>`).join('') : '<option value="">지정 가능한 사용자가 없습니다</option>'}
+        </select>
+      </div>
+      <button class="btn primary sm" id="adminAddBtn" ${nonAdmins.length?'':'disabled'}>관리자로 추가</button>
+    </div>
     <div class="table-wrap" style="margin-bottom:16px;"><table><thead><tr><th>닉네임</th><th>아이디</th><th>역할</th><th>가입일</th><th>선택</th></tr></thead><tbody>
       ${admins.map(a=>`<tr style="${a.uid===selUid?'background:rgba(255,143,163,.06);':''}">
         <td>${esc(a.displayName)}</td><td>${esc(a.loginId)}</td><td><span class="badge UR">ADMIN</span></td><td>${kst(a.createdAt)}</td>
@@ -1646,6 +1698,12 @@ function adminAdminsList(c){
       ${logs.map(l=>`<tr><td>${kst(l.createdAt)}</td><td>${esc(l.action)}</td><td>${esc(l.target)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">이력이 없습니다.</td></tr>'}
     </tbody></table></div>
   `;
+  const addBtn = document.getElementById('adminAddBtn');
+  if(addBtn) addBtn.onclick = ()=>{
+    const uid = document.getElementById('adminAddSel').value;
+    if(!uid) return;
+    toggleAdminRole(uid, true);
+  };
 }
 window.selectAdminHistory = function(uidVal){ window._adminSelUid = uidVal; adminAdminsList(document.getElementById('adminContent')); };
 </script>
