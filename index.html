@@ -574,7 +574,7 @@ function subscribeUserData(uidVal){
   state.unsub.push(onSnapshot(query(collection(db,'inventories',uidVal,'items'), orderBy('obtainedAt','desc')), snap=>{
     state.inventory = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
   }));
-  state.unsub.push(onSnapshot(query(collection(db,'drawLogs'), where('uid','==',uidVal)), snap=>{
+  state.unsub.push(onSnapshot(query(collection(db,'drawLogs'), where('uid','==',uidVal), limit(150)), snap=>{
     state.drawLogs = snap.docs.map(d=>({id:d.id, ...d.data()}))
       .sort((a,b)=>tsMillis(b.createdAt)-tsMillis(a.createdAt))
       .slice(0,100);
@@ -1102,16 +1102,17 @@ window.requestClaim = async (itemId)=>{
       if(data.status!=='ACTIVE') throw new Error('INVALID_STATUS');
       tx.update(itemRef, {status:'CLAIM_REQUESTED', claimRequestedAt: serverTimestamp()});
       tx.set(claimRef, {
-        uid: state.user.uid, itemId, name: data.name||'', rarity: data.rarity||'', imageUrl: data.imageUrl||'',
+        uid: state.user.uid, itemId, name: data.name||'', rarity: data.rarity||'',
         status:'PENDING', claimRequestedAt: serverTimestamp(), claimRequestedAtKST: kstNow()
       });
     });
     toast('수령 신청이 접수되었습니다.','ok');
   }catch(e){
-    console.error(e);
+    console.error('requestClaim error', e);
     if(e.message==='NOT_FOUND') toast('아이템을 찾을 수 없습니다.','err');
     else if(e.message==='INVALID_STATUS') toast('이미 처리 중인 아이템입니다.','err');
-    else toast('처리 중 오류가 발생했습니다.','err');
+    else if(e.code==='permission-denied') toast('권한이 없어 신청할 수 없습니다. 관리자에게 문의해주세요.','err');
+    else toast('처리 중 오류가 발생했습니다. ('+(e.code||e.message)+')','err');
   }
 };
 window.cancelClaim = async (itemId)=>{
