@@ -209,8 +209,8 @@ input,select,textarea{font-family:inherit;}
 
 /* ---------- draw reveal ---------- */
 .reveal-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:14px 0;}
-.reveal-cell{position:relative;aspect-ratio:3/4;border-radius:14px;overflow:visible;}
-.reveal-cell-clip{position:relative;width:100%;height:100%;border-radius:14px;overflow:hidden;border:2px solid var(--line);background:var(--surface-2);}
+.reveal-cell{position:relative;z-index:0;overflow:visible;}
+.reveal-cell-clip{position:relative;width:100%;aspect-ratio:3/4;border-radius:14px;overflow:hidden;border:2px solid var(--line);background:var(--surface-2);}
 .rc-face{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:var(--surface-2);}
 .rc-face-noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:10px;background:var(--surface-2);}
 .rc-mask{position:absolute;inset:0;z-index:5;background:linear-gradient(135deg,#FF8FA3,#6FCBEA);
@@ -483,7 +483,7 @@ function wireUploadField(fieldId, draft, key, folder){
 
 /* ---------------- state ---------------- */
 const state = {
-  user:null, users:{}, cardPacks:[], products:[], notices:[], settings:{},
+  user:null, authUid:null, users:{}, cardPacks:[], products:[], notices:[], settings:{},
   inventory:[], drawLogs:[], coinLedgers:[], auditLogs:[], admins:[], claims:[], chargeRequests:[],
   currentPackId:null, unsub:[]
 };
@@ -591,9 +591,9 @@ function subscribeAdminData(){
     state.coinLedgers = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
   }));
   try{
-    state.unsub.push(onSnapshot(query(collectionGroup(db,'items'), where('status','==','CLAIM_REQUESTED')), snap=>{
-      state.claims = snap.docs.map(d=>({id:d.id, uid:d.ref.parent.parent.id, ...d.data()})); render();
-    }, err=>{ console.warn('claims collectionGroup index needed', err); }));
+    state.unsub.push(onSnapshot(query(collection(db,'claimRequests'), where('status','==','PENDING')), snap=>{
+      state.claims = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+    }, err=>{ console.warn('claimRequests listener error', err); }));
   }catch(e){ console.warn(e); }
   try{
     state.unsub.push(onSnapshot(query(collection(db,'chargeRequests'), where('status','==','PENDING')), snap=>{
@@ -620,6 +620,7 @@ function onAuthStateChangedSafe(){
   onAuthStateChanged(auth, (u)=>{
     clearSubs();
     state.user=null; state.users={}; state.inventory=[]; state.drawLogs=[]; state.auditLogs=[]; state.admins=[]; state.claims=[];
+    state.authUid = u ? u.uid : null;
     if(u){
       subscribePublicData();
       subscribeUserData(u.uid);
@@ -656,7 +657,8 @@ function render(){
     return;
   }
   state._authRoute = null;
-  if(!u){ if(route!=='/login') go('#/login'); return; }
+  if(!state.authUid){ if(route!=='/login') go('#/login'); return; }
+  if(!u){ document.getElementById('app').innerHTML = '<div class="empty">불러오는 중...</div>'; return; }
 
   if(route.startsWith('/admin')){
     if(u.role!=='ADMIN'){ toast('관리자 권한이 없습니다.','err'); go('#/home'); return; }
@@ -1086,13 +1088,24 @@ window.sellItem = async (itemId)=>{
     toast(`${item.name} 판매 완료`, 'ok');
   }catch(e){ toast('판매 처리 중 오류가 발생했습니다.','err'); }
 };
-window.requestClaim = (itemId)=>{
-  updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'CLAIM_REQUESTED', claimRequestedAt:serverTimestamp()})
-    .then(()=>toast('수령 신청이 접수되었습니다.','ok')).catch(()=>toast('처리 실패','err'));
+window.requestClaim = async (itemId)=>{
+  const item = getInvItem(itemId);
+  try{
+    await updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'CLAIM_REQUESTED', claimRequestedAt:serverTimestamp()});
+    await addDoc(collection(db,'claimRequests'), {
+      uid: state.user.uid, itemId, name: item?item.name:'', rarity: item?item.rarity:'', imageUrl: item?(item.imageUrl||''):'',
+      status:'PENDING', claimRequestedAt: serverTimestamp(), claimRequestedAtKST: kstNow()
+    });
+    toast('수령 신청이 접수되었습니다.','ok');
+  }catch(e){ toast('처리 실패','err'); }
 };
-window.cancelClaim = (itemId)=>{
-  updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'ACTIVE', claimRequestedAt:null})
-    .then(()=>toast('수령 신청을 취소했습니다.','ok')).catch(()=>toast('처리 실패','err'));
+window.cancelClaim = async (itemId)=>{
+  try{
+    await updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'ACTIVE', claimRequestedAt:null});
+    const snap = await getDocs(query(collection(db,'claimRequests'), where('uid','==',state.user.uid), where('itemId','==',itemId), where('status','==','PENDING')));
+    await Promise.all(snap.docs.map(d=>deleteDoc(doc(db,'claimRequests',d.id))));
+    toast('수령 신청을 취소했습니다.','ok');
+  }catch(e){ toast('처리 실패','err'); }
 };
 
 /* ---------------- Draw history ---------------- */
@@ -1573,21 +1586,23 @@ function adminClaims(c){
         <td>${esc(state.users[r.uid]?state.users[r.uid].displayName:r.uid)}</td><td>${esc(r.name)}</td>
         <td><span class="badge ${r.rarity}">${rarityLabel(r.rarity)}</span></td><td>${kst(r.claimRequestedAt)}</td>
         <td>
-          <button class="btn sm mint" onclick="approveClaim('${r.uid}','${r.id}','${esc(r.name)}')">승인(지급완료)</button>
-          <button class="btn sm danger" onclick="rejectClaim('${r.uid}','${r.id}')">반려</button>
+          <button class="btn sm mint" onclick="approveClaim('${r.uid}','${r.itemId}','${r.id}','${esc(r.name)}')">승인(지급완료)</button>
+          <button class="btn sm danger" onclick="rejectClaim('${r.uid}','${r.itemId}','${r.id}')">반려</button>
         </td>
       </tr>`).join('') || '<tr><td colspan="5" class="muted">대기 중인 신청이 없습니다.</td></tr>'}
     </tbody></table></div>
   `;
 }
-window.approveClaim = async function(uidVal, itemId, name){
+window.approveClaim = async function(uidVal, itemId, claimId, name){
   if(!confirm(name+' 카드를 지급 완료 처리하고 보관함에서 삭제할까요?')) return;
   await deleteDoc(doc(db,'inventories',uidVal,'items',itemId));
+  await updateDoc(doc(db,'claimRequests',claimId), {status:'APPROVED', approvedAt:serverTimestamp()});
   await addAuditLog('카드 수령 승인(삭제)', `${uidVal}/${itemId}`, {name}, {status:'CLAIMED_DELETED'});
   toast('승인 처리되었습니다.','ok');
 };
-window.rejectClaim = async function(uidVal, itemId){
+window.rejectClaim = async function(uidVal, itemId, claimId){
   await updateDoc(doc(db,'inventories',uidVal,'items',itemId), {status:'ACTIVE', claimRequestedAt:null});
+  await updateDoc(doc(db,'claimRequests',claimId), {status:'REJECTED', rejectedAt:serverTimestamp()});
   await addAuditLog('카드 수령 반려', `${uidVal}/${itemId}`, null, {status:'ACTIVE'});
   toast('반려 처리되었습니다.','ok');
 };
