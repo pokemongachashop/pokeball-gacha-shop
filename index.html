@@ -906,8 +906,8 @@ window.doDraw = async function(count){
   const priceMap = {1:pack.drawPrice1, 5:pack.drawPrice5, 10:pack.drawPrice10};
   const price = priceMap[count];
   if(u.coin < price) return toast('코인이 부족합니다.','err');
-  const candidateIds = state.products.filter(p=>p.cardPackId===packId && p.status==='ACTIVE').map(p=>p.id);
-  if(candidateIds.length===0) return toast('뽑을 수 있는 상품이 없습니다.','err');
+  const candidateProducts = state.products.filter(p=>p.cardPackId===packId && p.status==='ACTIVE' && !p.forceSoldOut && p.currentStock>0);
+  if(candidateProducts.length===0) return toast('뽑을 수 있는 상품이 없습니다.','err');
 
   const maxAttempts = 4;
   let lastErr = null;
@@ -918,26 +918,42 @@ window.doDraw = async function(count){
         const userSnap = await tx.get(userRef);
         const userData = userSnap.data();
         if(!userData || userData.coin < price) throw new Error('INSUFFICIENT_COIN');
-        const productRefs = candidateIds.map(id=>doc(db,'products',id));
-        const productDocs = await Promise.all(productRefs.map(r=>tx.get(r)));
-        let pool = productDocs.filter(d=>d.exists()).map(d=>({id:d.id, ...d.data()}))
-          .filter(p=>p.status==='ACTIVE' && !p.forceSoldOut && p.currentStock>0);
-        const results = [];
-        const stockDelta = {};
+        // 화면에 캐시된 재고/확률 정보로 먼저 확률 추첨을 진행하고, 트랜잭션 안에서는
+        // 실제로 뽑힌 상품 문서만 읽고 검증한다. (모든 활성 상품을 매번 읽고 쓰면
+        // 동시에 뽑기를 하는 다른 유저들과 문서가 겹쳐 트랜잭션 충돌이 잦아지는 원인이 된다)
+        let pool = candidateProducts.map(p=>({...p}));
+        const picks = [];
         for(let i=0;i<count;i++){
           if(pool.length===0) break;
           const totalWeight = pool.reduce((s,p)=>s+Number(p.probability),0) || 1;
           let r = Math.random()*totalWeight;
           let picked = pool[pool.length-1];
           for(const p of pool){ if(r < p.probability){ picked=p; break; } r -= p.probability; }
+          picks.push(picked.id);
           picked.currentStock -= 1;
-          stockDelta[picked.id] = (stockDelta[picked.id]||0)+1;
-          results.push({...picked});
           if(picked.currentStock<=0) pool = pool.filter(p=>p.id!==picked.id);
+        }
+        if(picks.length===0) throw new Error('NO_STOCK');
+
+        const uniqueIds = [...new Set(picks)];
+        const productSnaps = {};
+        for(const pid of uniqueIds){
+          productSnaps[pid] = await tx.get(doc(db,'products',pid));
+        }
+
+        const results = [];
+        const stockDelta = {};
+        for(const pid of picks){
+          const snap = productSnaps[pid];
+          const data = snap.exists() ? snap.data() : null;
+          const already = stockDelta[pid] || 0;
+          if(!data || data.status!=='ACTIVE' || data.forceSoldOut || (data.currentStock - already) <= 0) continue;
+          stockDelta[pid] = already + 1;
+          results.push({id:pid, ...data});
         }
         if(results.length===0) throw new Error('NO_STOCK');
         Object.keys(stockDelta).forEach(pid=>{
-          const before = productDocs.find(d=>d.id===pid).data().currentStock;
+          const before = productSnaps[pid].data().currentStock;
           tx.update(doc(db,'products',pid), {currentStock: before - stockDelta[pid], updatedAt: serverTimestamp()});
         });
         const newCoin = userData.coin - price;
