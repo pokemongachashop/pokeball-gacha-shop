@@ -564,58 +564,81 @@ async function doLogin(loginId, password){
 function doLogout(){ signOut(auth); }
 window.doLogout = doLogout;
 
+/* ---------------- 자동 로그아웃 (5분 미접속 시) ---------------- */
+const INACTIVITY_LIMIT_MS = 5 * 60 * 1000; // 5분
+let lastActivityAt = Date.now();
+let inactivityTimerId = null;
+function markActivity(){ lastActivityAt = Date.now(); }
+['click','keydown','mousemove','touchstart','pointerdown','scroll','visibilitychange'].forEach(evt=>{
+  window.addEventListener(evt, markActivity, {passive:true});
+});
+function startInactivityWatcher(){
+  stopInactivityWatcher();
+  lastActivityAt = Date.now();
+  inactivityTimerId = setInterval(()=>{
+    if(document.visibilityState==='visible') { /* 활성 탭에서만 체크해도 되지만 백그라운드도 동일하게 처리 */ }
+    if(state.authUid && (Date.now() - lastActivityAt) > INACTIVITY_LIMIT_MS){
+      stopInactivityWatcher();
+      signOut(auth).then(()=>{ toast('5분간 활동이 없어 자동 로그아웃되었습니다.','err'); }).catch(()=>{});
+    }
+  }, 15000);
+}
+function stopInactivityWatcher(){
+  if(inactivityTimerId){ clearInterval(inactivityTimerId); inactivityTimerId = null; }
+}
+
 /* ---------------- data subscriptions ---------------- */
 function subscribePublicData(){
   state.unsub.push(onSnapshot(query(collection(db,'cardPacks'), orderBy('sortOrder','asc')), snap=>{
-    state.cardPacks = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+    state.cardPacks = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
   }));
   state.unsub.push(onSnapshot(collection(db,'products'), snap=>{
-    state.products = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+    state.products = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
   }));
   state.unsub.push(onSnapshot(collection(db,'notices'), snap=>{
-    state.notices = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+    state.notices = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
   }));
   state.unsub.push(onSnapshot(doc(db,'siteSettings','config'), snap=>{
     state.settings = snap.exists() ? snap.data() : {};
     if(!snap.exists()){
       setDoc(doc(db,'siteSettings','config'), {siteName:'Pokemon Gacha Shop', maintenanceMode:false, logoUrl:'', defaultImageUrl:''}).catch(()=>{});
     }
-    render();
+    scheduleRender();
   }));
 }
 function subscribeUserData(uidVal){
   state.unsub.push(onSnapshot(doc(db,'users',uidVal), snap=>{
     if(!snap.exists()) return;
     state.user = {uid:snap.id, ...snap.data()};
-    render();
+    scheduleRender();
   }));
   state.unsub.push(onSnapshot(query(collection(db,'drawLogs'), where('uid','==',uidVal), limit(150)), snap=>{
     state.drawLogs = snap.docs.map(d=>({id:d.id, ...d.data()}))
       .sort((a,b)=>tsMillis(b.createdAt)-tsMillis(a.createdAt))
       .slice(0,100);
-    render();
+    scheduleRender();
   }, err=>{ console.warn('drawLogs listener error', err); }));
 }
 function subscribeAdminData(){
   state.unsub.push(onSnapshot(collection(db,'users'), snap=>{
     state.users = {}; snap.docs.forEach(d=>{ state.users[d.id]={uid:d.id, ...d.data()}; });
     state.admins = Object.values(state.users).filter(u=>u.role==='ADMIN');
-    render();
+    scheduleRender();
   }));
   state.unsub.push(onSnapshot(query(collection(db,'auditLogs'), orderBy('createdAt','desc'), limit(500)), snap=>{
-    state.auditLogs = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+    state.auditLogs = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
   }, err=>{ console.warn('auditLogs listener error', err); }));
-  state.unsub.push(onSnapshot(collection(db,'coinLedgers'), snap=>{
-    state.coinLedgers = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
-  }));
+  state.unsub.push(onSnapshot(query(collection(db,'coinLedgers'), orderBy('createdAt','desc'), limit(300)), snap=>{
+    state.coinLedgers = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
+  }, err=>{ console.warn('coinLedgers listener error', err); }));
   try{
     state.unsub.push(onSnapshot(query(collection(db,'claimRequests'), where('status','==','PENDING')), snap=>{
-      state.claims = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+      state.claims = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
     }, err=>{ console.warn('claimRequests listener error', err); }));
   }catch(e){ console.warn(e); }
   try{
     state.unsub.push(onSnapshot(query(collection(db,'chargeRequests'), where('status','==','PENDING')), snap=>{
-      state.chargeRequests = snap.docs.map(d=>({id:d.id, ...d.data()})); render();
+      state.chargeRequests = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
     }, err=>{ console.warn('chargeRequests listener error', err); }));
   }catch(e){ console.warn(e); }
 }
@@ -642,14 +665,25 @@ function onAuthStateChangedSafe(){
     if(u){
       subscribePublicData();
       subscribeUserData(u.uid);
+      startInactivityWatcher();
     } else {
       subscribePublicData();
+      stopInactivityWatcher();
     }
     render();
   });
 }
 
 function currentRoute(){ return (location.hash || '#/home').replace('#',''); }
+
+/* 여러 onSnapshot이 거의 동시에 발생할 때(특히 최초 로딩 시) 매번 전체 DOM을 다시 그리지 않고
+   한 프레임에 한 번만 render()가 실행되도록 묶어서 로딩 체감 속도를 개선한다. */
+let _renderScheduled = false;
+function scheduleRender(){
+  if(_renderScheduled) return;
+  _renderScheduled = true;
+  Promise.resolve().then(()=>{ _renderScheduled = false; render(); });
+}
 
 function render(){
   if(!CONFIG_READY){ renderSetupScreen(); return; }
@@ -1964,31 +1998,3 @@ function adminAdminsList(c){
     <div class="field-row" style="display:flex;gap:8px;align-items:flex-end;margin-bottom:16px;">
       <div class="field" style="flex:1;margin-bottom:0;">
         <label>관리자로 지정할 사용자</label>
-        <select id="adminAddSel">
-          ${nonAdmins.length ? nonAdmins.map(u=>`<option value="${u.uid}">${esc(u.displayName)} (${esc(u.loginId)})</option>`).join('') : '<option value="">지정 가능한 사용자가 없습니다</option>'}
-        </select>
-      </div>
-      <button class="btn primary sm" id="adminAddBtn" ${nonAdmins.length?'':'disabled'}>관리자로 추가</button>
-    </div>
-    <div class="table-wrap" style="margin-bottom:16px;"><table><thead><tr><th>닉네임</th><th>아이디</th><th>역할</th><th>가입일</th><th>선택</th></tr></thead><tbody>
-      ${admins.map(a=>`<tr style="${a.uid===selUid?'background:rgba(255,143,163,.06);':''}">
-        <td>${esc(a.displayName)}</td><td>${esc(a.loginId)}</td><td><span class="badge UR">ADMIN</span></td><td>${kst(a.createdAt)}</td>
-        <td><button class="btn sm" onclick="selectAdminHistory('${a.uid}')">이력 보기</button></td>
-      </tr>`).join('') || '<tr><td colspan="5" class="muted">관리자가 없습니다.</td></tr>'}
-    </tbody></table></div>
-    <div class="h2">${admins.find(a=>a.uid===selUid) ? esc(admins.find(a=>a.uid===selUid).displayName) : ''}님의 변경 이력</div>
-    <div class="table-wrap"><table><thead><tr><th>시간</th><th>액션</th><th>대상</th></tr></thead><tbody>
-      ${logs.map(l=>`<tr><td>${kst(l.createdAt)}</td><td>${esc(l.action)}</td><td>${esc(l.target)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">이력이 없습니다.</td></tr>'}
-    </tbody></table></div>
-  `;
-  const addBtn = document.getElementById('adminAddBtn');
-  if(addBtn) addBtn.onclick = ()=>{
-    const uid = document.getElementById('adminAddSel').value;
-    if(!uid) return;
-    toggleAdminRole(uid, true);
-  };
-}
-window.selectAdminHistory = function(uidVal){ window._adminSelUid = uidVal; adminAdminsList(document.getElementById('adminContent')); };
-</script>
-</body>
-</html>
