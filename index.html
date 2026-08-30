@@ -307,6 +307,24 @@ tr:hover td{background:rgba(242,169,0,.05);}
 .maint-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;padding:24px;text-align:center;}
 .filter-bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;}
 .filter-bar>*{flex:1;min-width:120px;}
+
+/* ---------- Desktop / wide-screen layout (모바일 스타일은 그대로 두고 데스크톱용만 별도 추가) ---------- */
+@media (min-width: 900px){
+  body:not(.admin-wrap) #app{ max-width:720px; }
+  .pack-list{ display:grid; grid-template-columns:repeat(2,1fr); gap:12px; }
+  .grid{ grid-template-columns:repeat(4,1fr); }
+  .reveal-grid{ grid-template-columns:repeat(5,1fr); }
+  .bottom-nav{ max-width:720px; }
+  .drawbar-inner{ max-width:720px; }
+  .hero-card{ padding:28px 26px; }
+  .hero-title{ font-size:26px; }
+}
+@media (min-width: 1200px){
+  body:not(.admin-wrap) #app{ max-width:860px; }
+  .grid{ grid-template-columns:repeat(5,1fr); }
+  .bottom-nav{ max-width:860px; }
+  .drawbar-inner{ max-width:860px; }
+}
 </style>
 </head>
 <body>
