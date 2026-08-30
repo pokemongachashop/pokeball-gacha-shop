@@ -1998,3 +1998,31 @@ function adminAdminsList(c){
     <div class="field-row" style="display:flex;gap:8px;align-items:flex-end;margin-bottom:16px;">
       <div class="field" style="flex:1;margin-bottom:0;">
         <label>관리자로 지정할 사용자</label>
+<select id="adminAddSel">
+          ${nonAdmins.length ? nonAdmins.map(u=>`<option value="${u.uid}">${esc(u.displayName)} (${esc(u.loginId)})</option>`).join('') : '<option value="">지정 가능한 사용자가 없습니다</option>'}
+        </select>
+      </div>
+      <button class="btn primary sm" id="adminAddBtn" ${nonAdmins.length?'':'disabled'}>관리자로 추가</button>
+    </div>
+    <div class="table-wrap" style="margin-bottom:16px;"><table><thead><tr><th>닉네임</th><th>아이디</th><th>역할</th><th>가입일</th><th>선택</th></tr></thead><tbody>
+      ${admins.map(a=>`<tr style="${a.uid===selUid?'background:rgba(255,143,163,.06);':''}">
+        <td>${esc(a.displayName)}</td><td>${esc(a.loginId)}</td><td><span class="badge UR">ADMIN</span></td><td>${kst(a.createdAt)}</td>
+        <td><button class="btn sm" onclick="selectAdminHistory('${a.uid}')">이력 보기</button></td>
+      </tr>`).join('') || '<tr><td colspan="5" class="muted">관리자가 없습니다.</td></tr>'}
+    </tbody></table></div>
+    <div class="h2">${admins.find(a=>a.uid===selUid) ? esc(admins.find(a=>a.uid===selUid).displayName) : ''}님의 변경 이력</div>
+    <div class="table-wrap"><table><thead><tr><th>시간</th><th>액션</th><th>대상</th></tr></thead><tbody>
+      ${logs.map(l=>`<tr><td>${kst(l.createdAt)}</td><td>${esc(l.action)}</td><td>${esc(l.target)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">이력이 없습니다.</td></tr>'}
+    </tbody></table></div>
+  `;
+  const addBtn = document.getElementById('adminAddBtn');
+  if(addBtn) addBtn.onclick = ()=>{
+    const uid = document.getElementById('adminAddSel').value;
+    if(!uid) return;
+    toggleAdminRole(uid, true);
+  };
+}
+window.selectAdminHistory = function(uidVal){ window._adminSelUid = uidVal; adminAdminsList(document.getElementById('adminContent')); };
+</script>
+</body>
+</html>
