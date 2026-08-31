@@ -334,12 +334,13 @@ tr:hover td{background:rgba(242,169,0,.05);}
 <script type="module">
 /* ============================================================
    Pokemon Gacha Shop v2 — Firebase (Auth + Firestore only, Spark 무료 플랜)
-   1) 아래 firebaseConfig 를 본인 Firebase 프로젝트 값으로 교체하세요.
-   2) Firestore 보안 규칙을 콘솔에 등록해야 실제로 안전합니다.
-      (규칙 예시는 채팅 답변 본문에 함께 드렸습니다)
-   3) Storage는 사용하지 않습니다. 이미지는 브라우저에서 자동 압축 후
-      Base64 문자열로 변환되어 Firestore 문서 필드에 직접 저장됩니다.
-      (Firestore 문서는 1MiB 제한이 있어 이미지당 100~200KB 수준으로 압축합니다)
+   [패치 메모]
+   - resource-exhausted(Firestore 할당량 초과) 오류 대응:
+     관리자 화면이 열려 있는 동안 상시로 유지되던 무거운 실시간 리스너
+     (users 컬렉션 전체 + auditLogs 500건 + coinLedgers 300건)를 줄였습니다.
+     · auditLogs, coinLedgers는 실시간 구독을 없애고 "관리자 화면 진입 시 1회 조회 + 새로고침 버튼" 방식으로 전환
+     · 관리자(/admin) 화면을 벗어나면 무거운 리스너를 즉시 해제(unsubscribeAdminData)
+     · 코인 충전/차감, 충전요청 승인 실패 시 resource-exhausted 코드를 별도로 안내
    ============================================================ */
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {
@@ -505,7 +506,10 @@ const state = {
   inventory:[], drawLogs:[], coinLedgers:[], auditLogs:[], admins:[], claims:[], chargeRequests:[],
   currentPackId:null, unsub:[]
 };
-function clearSubs(){ state.unsub.forEach(f=>{ try{f();}catch(e){} }); state.unsub=[]; }
+function clearSubs(){
+  state.unsub.forEach(f=>{ try{f();}catch(e){} }); state.unsub=[];
+  unsubscribeAdminData();
+}
 
 /* ---------------- auth ---------------- */
 async function checkUsersEmpty(){
@@ -619,6 +623,13 @@ function subscribeUserData(uidVal){
     scheduleRender();
   }, err=>{ console.warn('drawLogs listener error', err); }));
 }
+
+/* ---------------- admin data subscriptions ----------------
+   관리자 화면에서만 필요한 무거운 리스너들을 별도의 unsub 배열(adminUnsub)로 관리한다.
+   - users 전체 컬렉션은 실시간으로 유지하되(사용자 관리 화면에 필요),
+   - auditLogs / coinLedgers 는 실시간 구독을 없애고 "관리자 화면 진입 시 1회 조회 + 새로고침 버튼"
+     방식으로 바꿔 불필요한 읽기 소모(→ resource-exhausted 원인)를 크게 줄인다.
+   - 관리자 화면을 벗어나면 unsubscribeAdminData()로 즉시 리스너를 해제한다. */
 let adminUnsub = [];
 function subscribeAdminData(){
   if(adminUnsub.length) return; // 이미 구독 중이면 중복 구독 방지
@@ -627,7 +638,6 @@ function subscribeAdminData(){
     state.admins = Object.values(state.users).filter(u=>u.role==='ADMIN');
     scheduleRender();
   }));
-  // auditLogs, coinLedgers는 실시간 구독을 없애고, 아래 4)번처럼 "필요할 때만" getDocs로 불러옵니다.
   try{
     adminUnsub.push(onSnapshot(query(collection(db,'claimRequests'), where('status','==','PENDING')), snap=>{
       state.claims = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
@@ -643,24 +653,33 @@ function unsubscribeAdminData(){
   adminUnsub.forEach(f=>{ try{f();}catch(e){} });
   adminUnsub = [];
   state._adminSubscribed = false;
+  // 관리자 화면을 벗어날 때 온디맨드로 불러온 무거운 목록들도 비워서
+  // 다음 진입 시 최신 데이터를 다시 가져오도록 한다.
+  state._coinLedgersLoaded = false;
+  state._auditLogsLoaded = false;
 }
-  state.unsub.push(onSnapshot(query(collection(db,'auditLogs'), orderBy('createdAt','desc'), limit(500)), snap=>{
-    state.auditLogs = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
-  }, err=>{ console.warn('auditLogs listener error', err); }));
-  state.unsub.push(onSnapshot(query(collection(db,'coinLedgers'), orderBy('createdAt','desc'), limit(300)), snap=>{
-    state.coinLedgers = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
-  }, err=>{ console.warn('coinLedgers listener error', err); }));
+async function loadAdminCoinLedgers(){
   try{
-    state.unsub.push(onSnapshot(query(collection(db,'claimRequests'), where('status','==','PENDING')), snap=>{
-      state.claims = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
-    }, err=>{ console.warn('claimRequests listener error', err); }));
-  }catch(e){ console.warn(e); }
-  try{
-    state.unsub.push(onSnapshot(query(collection(db,'chargeRequests'), where('status','==','PENDING')), snap=>{
-      state.chargeRequests = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
-    }, err=>{ console.warn('chargeRequests listener error', err); }));
-  }catch(e){ console.warn(e); }
+    const snap = await getDocs(query(collection(db,'coinLedgers'), orderBy('createdAt','desc'), limit(150)));
+    state.coinLedgers = snap.docs.map(d=>({id:d.id, ...d.data()}));
+  }catch(e){
+    console.warn('coinLedgers load error', e);
+    toast('코인 원장을 불러오지 못했습니다.','err');
+  }
+  render();
 }
+window.loadAdminCoinLedgers = loadAdminCoinLedgers;
+async function loadAdminAuditLogs(){
+  try{
+    const snap = await getDocs(query(collection(db,'auditLogs'), orderBy('createdAt','desc'), limit(300)));
+    state.auditLogs = snap.docs.map(d=>({id:d.id, ...d.data()}));
+  }catch(e){
+    console.warn('auditLogs load error', e);
+    toast('감사 로그를 불러오지 못했습니다.','err');
+  }
+  render();
+}
+window.loadAdminAuditLogs = loadAdminAuditLogs;
 async function addAuditLog(action, target, before, after){
   const admin = state.user;
   try{
@@ -710,9 +729,13 @@ function render(){
   const u = state.user;
   document.body.classList.toggle('admin-wrap', route.startsWith('/admin'));
 
-  if(u && u.role==='ADMIN' && !state._adminSubscribed){
+  if(u && u.role==='ADMIN' && route.startsWith('/admin') && !state._adminSubscribed){
     state._adminSubscribed = true;
     subscribeAdminData();
+  }
+  if(!route.startsWith('/admin') && state._adminSubscribed){
+    // 관리자 화면을 벗어나면 무거운 실시간 리스너를 즉시 해제해 불필요한 읽기 소모를 막는다
+    unsubscribeAdminData();
   }
 
   if(state.settings.maintenanceMode && !(u && u.role==='ADMIN') && route!=='/login' && route!=='/register'){
@@ -1003,6 +1026,7 @@ window.doDraw = async function(count){
   console.error(lastErr);
   if(lastErr && lastErr.message==='INSUFFICIENT_COIN') toast('코인이 부족합니다.','err');
   else if(lastErr && lastErr.message==='NO_STOCK') toast('재고가 부족합니다.','err');
+  else if(lastErr && lastErr.code==='resource-exhausted') toast('Firebase 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요.','err');
   else toast('다른 유저와 요청이 겹쳐 처리가 지연되었습니다. 다시 시도해주세요.','err');
 };
 
@@ -1477,6 +1501,7 @@ function adminDashboard(c){
   const packs = state.cardPacks; const products = state.products;
   const totalCoin = users.reduce((s,u)=>s+(u.coin||0),0);
   const soldout = products.filter(p=>p.forceSoldOut||p.currentStock<=0).length;
+  if(!state._auditLogsLoaded){ state._auditLogsLoaded = true; loadAdminAuditLogs(); }
   c.innerHTML = `
     <div class="admin-topbar"><h1>대시보드</h1></div>
     <div class="stat-grid">
@@ -1572,11 +1597,13 @@ async function submitCoinOp(userUid, type){
     });
     await addAuditLog(type==='CHARGE'?'코인 충전':'코인 차감', userUid, {coin:result.before}, {coin:result.after, memo});
     closeModal(); toast('코인이 처리되었습니다.','ok');
+    if(state._coinLedgersLoaded) loadAdminCoinLedgers();
   }catch(e){
     console.error('submitCoinOp error', e);
     if(e.message==='NEGATIVE') toast('차감 후 코인이 음수가 될 수 없습니다.','err');
     else if(e.message==='USER_NOT_FOUND') toast('대상 사용자를 찾을 수 없습니다.','err');
     else if(e.code==='permission-denied') toast('권한이 없어 처리할 수 없습니다. Firestore 보안 규칙에서 관리자가 다른 사용자의 coin 필드와 coinLedgers 문서를 수정/생성할 수 있도록 허용되어 있는지 확인해주세요.','err');
+    else if(e.code==='resource-exhausted') toast('Firebase 사용량 한도를 초과했습니다. Firebase 콘솔의 Usage 탭을 확인하거나 Blaze 요금제로 전환해주세요.','err');
     else toast('처리 중 오류가 발생했습니다. ('+(e.code||e.message)+')','err');
   }
 }
@@ -1781,9 +1808,10 @@ window.deleteProduct = async function(productId, name){
 };
 
 function adminCoin(c){
+  if(!state._coinLedgersLoaded){ state._coinLedgersLoaded = true; loadAdminCoinLedgers(); }
   const rows = state.coinLedgers.slice().sort((a,b)=>tsMillis(b.createdAt)-tsMillis(a.createdAt));
   c.innerHTML = `
-    <div class="admin-topbar"><h1>코인 Ledger</h1></div>
+    <div class="admin-topbar"><h1>코인 Ledger</h1><button class="btn sm" onclick="loadAdminCoinLedgers()">새로고침</button></div>
     <p class="muted">코인 충전은 디스코드 봇에서 전송받은 코인을 관리자가 사용자 화면에서 확인하여 반영하는 방식입니다. 사용자 관리 페이지에서 대상자를 선택해 충전/차감하세요.</p>
     <div class="table-wrap"><table><thead><tr><th>시간</th><th>사용자</th><th>유형</th><th>변동</th><th>이후잔액</th><th>메모</th></tr></thead><tbody>
       ${rows.slice(0,150).map(l=>`<tr>
@@ -1861,10 +1889,12 @@ window.approveChargeRequest = async function(reqId, userUid, amount){
     });
     await addAuditLog('충전 요청 승인', userUid, {coin:result.before}, {coin:result.after, amount});
     toast('충전이 승인되었습니다.','ok');
+    if(state._coinLedgersLoaded) loadAdminCoinLedgers();
   }catch(e){
     console.error('approveChargeRequest error', e);
     if(e.message==='USER_NOT_FOUND') toast('대상 사용자를 찾을 수 없습니다.','err');
     else if(e.code==='permission-denied') toast('권한이 없어 처리할 수 없습니다. Firestore 보안 규칙에서 관리자가 다른 사용자의 coin/chargeRequests 문서를 수정할 수 있도록 허용되어 있는지 확인해주세요.','err');
+    else if(e.code==='resource-exhausted') toast('Firebase 사용량 한도를 초과했습니다. Firebase 콘솔의 Usage 탭을 확인하거나 Blaze 요금제로 전환해주세요.','err');
     else toast('처리 중 오류가 발생했습니다. ('+(e.code||e.message)+')','err');
   }
 };
@@ -2027,6 +2057,7 @@ function adminSettings(c){
 /* ---------- Audit Logs: filter + CSV ---------- */
 let logFilter = {admin:'', action:'', from:'', to:''};
 function adminLogs(c){
+  if(!state._auditLogsLoaded){ state._auditLogsLoaded = true; loadAdminAuditLogs(); }
   const admins = state.admins;
   let logs = state.auditLogs.slice();
   if(logFilter.admin) logs = logs.filter(l=>l.adminUid===logFilter.admin);
@@ -2034,7 +2065,7 @@ function adminLogs(c){
   if(logFilter.from) logs = logs.filter(l=>tsMillis(l.createdAt) >= new Date(logFilter.from).getTime());
   if(logFilter.to) logs = logs.filter(l=>tsMillis(l.createdAt) <= new Date(logFilter.to).getTime()+86400000);
   c.innerHTML = `
-    <div class="admin-topbar"><h1>감사 로그</h1><button class="btn primary sm" id="logCsvBtn">CSV 다운로드</button></div>
+    <div class="admin-topbar"><h1>감사 로그</h1><button class="btn sm" onclick="loadAdminAuditLogs()">새로고침</button><button class="btn primary sm" id="logCsvBtn">CSV 다운로드</button></div>
     <div class="filter-bar">
       <select id="logAdminSel"><option value="">전체 관리자</option>${admins.map(a=>`<option value="${a.uid}" ${logFilter.admin===a.uid?'selected':''}>${esc(a.displayName)}</option>`).join('')}</select>
       <input id="logActionInput" placeholder="액션 검색 (예: 코인)" value="${esc(logFilter.action)}">
@@ -2069,6 +2100,7 @@ function adminAdminsList(c){
   const nonAdmins = Object.values(state.users).filter(u=>u.role!=='ADMIN');
   const selUid = window._adminSelUid || (admins[0] && admins[0].uid);
   window._adminSelUid = selUid;
+  if(!state._auditLogsLoaded){ state._auditLogsLoaded = true; loadAdminAuditLogs(); }
   const logs = state.auditLogs.filter(l=>l.adminUid===selUid).slice(0,100);
   c.innerHTML = `
     <div class="admin-topbar"><h1>관리자 목록</h1></div>
