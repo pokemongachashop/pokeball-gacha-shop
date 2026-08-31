@@ -619,12 +619,31 @@ function subscribeUserData(uidVal){
     scheduleRender();
   }, err=>{ console.warn('drawLogs listener error', err); }));
 }
+let adminUnsub = [];
 function subscribeAdminData(){
-  state.unsub.push(onSnapshot(collection(db,'users'), snap=>{
+  if(adminUnsub.length) return; // 이미 구독 중이면 중복 구독 방지
+  adminUnsub.push(onSnapshot(collection(db,'users'), snap=>{
     state.users = {}; snap.docs.forEach(d=>{ state.users[d.id]={uid:d.id, ...d.data()}; });
     state.admins = Object.values(state.users).filter(u=>u.role==='ADMIN');
     scheduleRender();
   }));
+  // auditLogs, coinLedgers는 실시간 구독을 없애고, 아래 4)번처럼 "필요할 때만" getDocs로 불러옵니다.
+  try{
+    adminUnsub.push(onSnapshot(query(collection(db,'claimRequests'), where('status','==','PENDING')), snap=>{
+      state.claims = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
+    }, err=>{ console.warn('claimRequests listener error', err); }));
+  }catch(e){ console.warn(e); }
+  try{
+    adminUnsub.push(onSnapshot(query(collection(db,'chargeRequests'), where('status','==','PENDING')), snap=>{
+      state.chargeRequests = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
+    }, err=>{ console.warn('chargeRequests listener error', err); }));
+  }catch(e){ console.warn(e); }
+}
+function unsubscribeAdminData(){
+  adminUnsub.forEach(f=>{ try{f();}catch(e){} });
+  adminUnsub = [];
+  state._adminSubscribed = false;
+}
   state.unsub.push(onSnapshot(query(collection(db,'auditLogs'), orderBy('createdAt','desc'), limit(500)), snap=>{
     state.auditLogs = snap.docs.map(d=>({id:d.id, ...d.data()})); scheduleRender();
   }, err=>{ console.warn('auditLogs listener error', err); }));
