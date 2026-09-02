@@ -394,6 +394,19 @@ if(CONFIG_READY){
   setPersistence(auth, browserLocalPersistence).catch(()=>{});  
 }  
   
+/* ---------------- Cloudinary 설정 (이미지 업로드용) ----------------  
+   Firestore에 이미지를 base64로 저장하지 않고, Cloudinary에 업로드한 뒤  
+   반환되는 URL 문자열만 Firestore 문서에 저장한다(용량/전송량 절감).  
+   설정 방법:  
+   1) https://cloudinary.com 무료 가입 (카드 등록 불필요)  
+   2) Dashboard 상단에서 "Cloud name" 확인 (예: dxxxxxxxx)  
+   3) Settings(톱니바퀴) > Upload > Upload presets > Add upload preset  
+      - Signing Mode를 반드시 "Unsigned"로 설정 후 저장, preset 이름 확인  
+   4) 아래 두 값을 본인 것으로 교체 */  
+const CLOUDINARY_CLOUD_NAME = "YOUR_CLOUD_NAME";  
+const CLOUDINARY_UPLOAD_PRESET = "YOUR_UPLOAD_PRESET";  
+const CLOUDINARY_READY = CLOUDINARY_CLOUD_NAME !== "YOUR_CLOUD_NAME" && CLOUDINARY_UPLOAD_PRESET !== "YOUR_UPLOAD_PRESET";  
+  
 /* ---------------- utils ---------------- */  
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }  
 function fmtCoin(n){ return `<span class="coin-dot"></span><span class="coin-txt">${(n||0).toLocaleString('ko-KR')}</span>`; }  
@@ -428,10 +441,13 @@ function rarityLabel(r){ return r || 'N'; }
 function go(hash){ location.hash = hash; }  
 window.go = go; window.closeModal = closeModal;  
   
-/* ---------------- image upload (gallery/camera -> Base64, Storage 미사용) ----------------  
-   Firestore 문서는 1MiB 제한이 있으므로, 이미지를 캔버스에서 리사이즈한 뒤  
-   목표 용량(약 150KB)에 맞춰 JPEG 품질을 단계적으로 낮춰가며 압축하고,  
-   최종적으로 data:image/jpeg;base64,... 문자열로 반환해 Firestore 필드에 직접 저장한다. */  
+/* ---------------- image upload (gallery/camera -> Cloudinary) ----------------  
+   이미지를 Firestore에 base64로 저장하지 않는다. 대신 캔버스에서 적당한  
+   해상도로 리사이즈한 뒤 Blob으로 변환해 Cloudinary에 업로드하고,  
+   Cloudinary가 반환하는 URL 문자열만 Firestore 필드에 저장한다.  
+   이렇게 하면 Firestore 문서는 작은 텍스트만 갖게 되어 저장 용량/  
+   읽기 전송량 문제가 해결되고, 이미지는 브라우저가 URL 기준으로  
+   캐싱하므로 같은 이미지를 반복해서 다시 받지 않는다. */  
 function loadImageEl(file){  
   return new Promise((resolve,reject)=>{  
     const img = new Image();  
@@ -441,19 +457,9 @@ function loadImageEl(file){
     img.src = url;  
   });  
 }  
-function canvasToDataUrl(canvas, quality){  
-  return canvas.toDataURL('image/jpeg', quality);  
-}  
-function dataUrlSizeBytes(dataUrl){  
-  // base64 payload length -> approximate byte size  
-  const idx = dataUrl.indexOf(',');  
-  const b64 = idx>=0 ? dataUrl.slice(idx+1) : dataUrl;  
-  return Math.ceil(b64.length * 3 / 4);  
-}  
-async function compressImageToDataUrl(file, opts){  
-  const maxDim = (opts && opts.maxDim) || 900;  
-  const targetBytes = (opts && opts.targetBytes) || 150*1024; // ~150KB  
-  const hardCapBytes = (opts && opts.hardCapBytes) || 700*1024; // Firestore 문서 1MiB 대비 여유  
+async function resizeImageToBlob(file, opts){  
+  const maxDim = (opts && opts.maxDim) || 1280;  
+  const quality = (opts && opts.quality) || 0.85;  
   const img = await loadImageEl(file);  
   let {width,height} = img;  
   if(width>maxDim || height>maxDim){  
@@ -463,34 +469,35 @@ async function compressImageToDataUrl(file, opts){
   const canvas = document.createElement('canvas');  
   canvas.width = width; canvas.height = height;  
   canvas.getContext('2d').drawImage(img,0,0,width,height);  
-  
-  // 1) 품질을 낮춰가며 목표 용량에 맞춘다  
-  let quality = 0.85;  
-  let dataUrl = canvasToDataUrl(canvas, quality);  
-  let tries = 0;  
-  while(dataUrlSizeBytes(dataUrl) > targetBytes && quality > 0.35 && tries < 8){  
-    quality -= 0.1;  
-    dataUrl = canvasToDataUrl(canvas, quality);  
-    tries++;  
+  return await new Promise((resolve,reject)=>{  
+    canvas.toBlob(blob=>{ blob ? resolve(blob) : reject(new Error('이미지 변환에 실패했습니다.')); }, 'image/jpeg', quality);  
+  });  
+}  
+async function uploadToCloudinary(blob, folder){  
+  const form = new FormData();  
+  form.append('file', blob);  
+  form.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);  
+  if(folder) form.append('folder', folder);  
+  let res;  
+  try{  
+    res = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/image/upload`, {method:'POST', body:form});  
+  }catch(e){  
+    throw new Error('Cloudinary 서버에 연결하지 못했습니다. 네트워크 상태를 확인해주세요.');  
   }  
-  // 2) 그래도 너무 크면 해상도를 추가로 줄인다  
-  let curW = width, curH = height, shrinkTries = 0;  
-  while(dataUrlSizeBytes(dataUrl) > hardCapBytes && shrinkTries < 5){  
-    curW = Math.round(curW*0.8); curH = Math.round(curH*0.8);  
-    const c2 = document.createElement('canvas');  
-    c2.width = curW; c2.height = curH;  
-    c2.getContext('2d').drawImage(canvas,0,0,curW,curH);  
-    dataUrl = canvasToDataUrl(c2, 0.6);  
-    shrinkTries++;  
+  if(!res.ok){  
+    let msg = '';  
+    try{ const err = await res.json(); msg = err && err.error && err.error.message; }catch(e){}  
+    throw new Error('Cloudinary 업로드 실패'+(msg?': '+msg:'')+' (upload_preset이 Unsigned로 설정되어 있는지 확인해주세요.)');  
   }  
-  if(dataUrlSizeBytes(dataUrl) > hardCapBytes){  
-    throw new Error('이미지 용량이 너무 큽니다. 더 작은 이미지를 선택해주세요.');  
-  }  
-  return dataUrl;  
+  const data = await res.json();  
+  return data.secure_url;  
 }  
 async function uploadImage(file, folder){  
-  // folder 파라미터는 이제 실제 업로드 경로가 아니라 필드 구분용 힌트로만 남겨둔다(호환성 유지).  
-  return await compressImageToDataUrl(file, {maxDim:900, targetBytes:150*1024});  
+  if(!CLOUDINARY_READY){  
+    throw new Error('Cloudinary 설정이 필요합니다. 코드 상단의 CLOUDINARY_CLOUD_NAME / CLOUDINARY_UPLOAD_PRESET 값을 채워주세요.');  
+  }  
+  const blob = await resizeImageToBlob(file, {maxDim:1280, quality:0.85});  
+  return await uploadToCloudinary(blob, folder);  
 }  
 /* renders an upload field; draft[key] holds current url, updated on upload */  
 function uploadFieldHtml(fieldId, label, draft, key, folder){  
@@ -1855,143 +1862,8 @@ function adminProducts(c){
     <div class="field"><select id="pdPackSel">  
       ${packs.map(p=>`<option value="${p.id}" ${p.id===filterPack?'selected':''}>${esc(p.name)}</option>`).join('')}  
     </select></div>  
-    <div class="muted" style="margin-bottom:10px;">확률 합계: <b style="color:${Math.abs(probSum-100)<0.01?'var(--success)':'var(--danger-deep)'}">${probSum.toFixed(2)}%</b> ${Math.abs(probSum-100)>=0.01?'(100%가 되도록 조정을 권장합니다)':''}</div>  
-    <div class="muted" style="margin-bottom:8px;">▲▼ 버튼으로 상품 노출 순서를 원하는 대로 조정할 수 있습니다.</div>  
-    <div class="table-wrap"><table><thead><tr><th>순서</th><th>이름</th><th>등급</th><th>확률</th><th>재고</th><th>즉시판매</th><th>상태</th><th>작업</th></tr></thead><tbody>  
-      ${products.map((p,i)=>`<tr>  
-        <td><button class="btn sm" onclick="moveProduct('${p.id}',-1)" ${i===0?'disabled':''}>▲</button> <button class="btn sm" onclick="moveProduct('${p.id}',1)" ${i===products.length-1?'disabled':''}>▼</button></td>  
-        <td>${esc(p.name)}</td><td><span class="badge ${p.rarity}">${rarityLabel(p.rarity)}</span></td>  
-        <td>${p.probability}%</td><td>${p.currentStock}/${p.initialStock}</td><td>${fmtCoin(p.sellCoin)}</td>  
-        <td>${p.forceSoldOut?'<span class="badge N">품절처리</span>':(p.currentStock<=0?'<span class="badge N">재고없음</span>':'<span class="badge R">판매중</span>')}</td>  
-        <td>  
-          <button class="btn sm" onclick="openProductForm('${p.id}','${filterPack}')">수정</button>  
-          <button class="btn sm ${p.forceSoldOut?'':'danger'}" onclick="toggleForceSoldOut('${p.id}')">${p.forceSoldOut?'품절해제':'강제품절'}</button>  
-          <button class="btn sm danger" onclick="deleteProduct('${p.id}','${esc(p.name)}')">삭제</button>  
-        </td>  
-      </tr>`).join('') || '<tr><td colspan="8" class="muted">상품 없음</td></tr>'}  
-    </tbody></table></div>  
-  `;  
-  document.getElementById('pdNewBtn').onclick = ()=>openProductForm(null, filterPack);  
-  document.getElementById('pdPackSel').onchange = (e)=>{ window._adminProdPack = e.target.value; adminProducts(document.getElementById('adminContent')); };  
-}  
-window.moveProduct = async function(productId, direction){  
-  const packId = window._adminProdPack;  
-  const list = state.products.filter(p=>p.cardPackId===packId)  
-    .sort((a,b)=>(a.sortOrder??0)-(b.sortOrder??0));  
-  const idx = list.findIndex(p=>p.id===productId);  
-  const swapIdx = idx + direction;  
-  if(idx<0 || swapIdx<0 || swapIdx>=list.length) return;  
-  const tmp = list[idx]; list[idx] = list[swapIdx]; list[swapIdx] = tmp;  
-  try{  
-    let batch = writeBatch(db);  
-    list.forEach((p, i)=>{ batch.update(doc(db,'products',p.id), {sortOrder:i, updatedAt:serverTimestamp()}); });  
-    await batch.commit();  
-    await addAuditLog('상품 순서 변경', productId, null, {direction});  
-    await reloadProducts();  
-    render();  
-  }catch(e){  
-    console.error('moveProduct error', e);  
-    toast('순서 변경 중 오류가 발생했습니다.','err');  
-  }  
-};  
-window.openProductForm = function(productId, packId){  
-  const p = productId ? state.products.find(x=>x.id===productId) : {name:'',imageUrl:'',rarity:'N',probability:10,initialStock:100,currentStock:100,sellCoin:10,forceSoldOut:false};  
-  const draft = {imageUrl:p.imageUrl||''};  
-  openModal(`  
-    <div class="modal-head"><div class="mt">${productId?'상품 수정':'상품 추가'}</div><button class="btn sm" onclick="closeModal()">닫기</button></div>  
-    <div class="field"><label>상품명</label><input id="pd_name" value="${esc(p.name)}"></div>  
-    ${uploadFieldHtml('pd_img','상품 이미지',draft,'imageUrl','products')}  
-    <div class="row">  
-      <div class="field"><label>등급</label><select id="pd_rarity">  
-        ${['N','R','SR','SSR','UR'].map(r=>`<option value="${r}" ${p.rarity===r?'selected':''}>${r}</option>`).join('')}  
-      </select></div>  
-      <div class="field"><label>확률(%)</label><input id="pd_prob" type="number" step="0.1" value="${p.probability}"></div>  
-    </div>  
-    <div class="row">  
-      <div class="field"><label>${productId?'현재 재고':'초기 재고'}</label><input id="pd_stock" type="number" value="${productId?p.currentStock:p.initialStock}"></div>  
-      <div class="field"><label>즉시판매 코인</label><input id="pd_sell" type="number" value="${p.sellCoin}"></div>  
-    </div>  
-    <button class="btn primary block" id="pd_save">저장</button>  
-  `);  
-  wireUploadField('pd_img', draft, 'imageUrl', 'products');  
-  document.getElementById('pd_save').onclick = async ()=>{  
-    const name = document.getElementById('pd_name').value.trim();  
-    if(!name) return toast('상품명을 입력해주세요.','err');  
-    const stock = parseInt(document.getElementById('pd_stock').value,10);  
-    if(stock<0) return toast('재고는 0 이상이어야 합니다.','err');  
-    const data = {  
-      name, imageUrl: draft.imageUrl, rarity: document.getElementById('pd_rarity').value,  
-      probability: parseFloat(document.getElementById('pd_prob').value)||0,  
-      sellCoin: parseInt(document.getElementById('pd_sell').value,10)||0,  
-      updatedAt: serverTimestamp(), updatedAtKST: kstNow(),  
-    };  
-    try{  
-      if(productId){  
-        const before = {...state.products.find(x=>x.id===productId)};  
-        await updateDoc(doc(db,'products',productId), {...data, currentStock:stock});  
-        await addAuditLog('상품 수정', productId, before, data);  
-      } else {  
-        const newSortOrder = state.products.filter(x=>x.cardPackId===packId).length;  
-        const ref = await addDoc(collection(db,'products'), {...data, cardPackId:packId, status:'ACTIVE', forceSoldOut:false, initialStock:stock, currentStock:stock, sortOrder:newSortOrder, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
-        await addAuditLog('상품 생성', ref.id, null, data);  
-      }  
-      await reloadProducts();  
-      closeModal(); toast('저장되었습니다.','ok'); render();  
-    }catch(e){ toast('저장 중 오류가 발생했습니다.','err'); }  
-  };  
-};  
-window.toggleForceSoldOut = async function(productId){  
-  const p = state.products.find(x=>x.id===productId);  
-  const before = p.forceSoldOut;  
-  await updateDoc(doc(db,'products',productId), {forceSoldOut: !before, updatedAt:serverTimestamp()});  
-  await addAuditLog('강제품절 토글', productId, {forceSoldOut:before}, {forceSoldOut:!before});  
-  // 재조회 없이 로컬 캐시만 갱신(read 절감)  
-  p.forceSoldOut = !before;  
-  toast('변경되었습니다.','ok'); render();  
-};  
-window.deleteProduct = async function(productId, name){  
-  if(!confirm(name+' 상품을 정말 삭제할까요? 이 작업은 되돌릴 수 없습니다.')) return;  
-  try{  
-    const before = {...state.products.find(x=>x.id===productId)};  
-    await deleteDoc(doc(db,'products',productId));  
-    await addAuditLog('상품 삭제', productId, before, null);  
-    state.products = state.products.filter(x=>x.id!==productId);  
-    toast('상품이 삭제되었습니다.','ok'); render();  
-  }catch(e){  
-    console.error('deleteProduct error', e);  
-    toast('삭제 중 오류가 발생했습니다.','err');  
-  }  
-};  
-  
-function adminCoin(c){  
-  if(!state._usersLoaded){ loadAdminUsers(); }  
-  if(!state._coinLedgersLoaded){ state._coinLedgersLoaded = true; loadAdminCoinLedgers(); }  
-  const rows = state.coinLedgers.slice().sort((a,b)=>tsMillis(b.createdAt)-tsMillis(a.createdAt));  
-  c.innerHTML = `  
-    <div class="admin-topbar"><h1>코인 Ledger</h1><button class="btn sm" onclick="loadAdminCoinLedgers()">새로고침</button></div>  
-    <p class="muted">코인 충전은 디스코드 봇에서 전송받은 코인을 관리자가 사용자 화면에서 확인하여 반영하는 방식입니다. 사용자 관리 페이지에서 대상자를 선택해 충전/차감하세요.</p>  
-    <div class="table-wrap"><table><thead><tr><th>시간</th><th>사용자</th><th>유형</th><th>변동</th><th>이후잔액</th><th>메모</th></tr></thead><tbody>  
-      ${rows.slice(0,150).map(l=>`<tr>  
-        <td>${kst(l.createdAt)}</td><td>${esc(state.users[l.uid]?state.users[l.uid].displayName:l.uid)}</td>  
-        <td>${esc(l.type)}</td><td style="color:${l.changeCoin>=0?'var(--success)':'var(--danger-deep)'}">${l.changeCoin>=0?'+':''}${l.changeCoin}</td>  
-        <td>${l.afterCoin}</td><td>${esc(l.memo)}</td>  
-      </tr>`).join('') || '<tr><td colspan="6" class="muted">기록 없음</td></tr>'}  
-    </tbody></table></div>  
-  `;  
-}  
-  
-function adminClaims(c){  
-  if(!state._usersLoaded){ loadAdminUsers(); }  
-  if(!state._claimsLoaded){ loadAdminClaims(); }  
-  const rows = state.claims.slice().sort((a,b)=>tsMillis(a.claimRequestedAt)-tsMillis(b.claimRequestedAt));  
-  c.innerHTML = `  
-    <div class="admin-topbar"><h1>카드 수령 승인</h1><button class="btn sm" onclick="loadAdminClaims()">새로고침</button></div>  
-    <p class="muted">사용자가 뽑은 카드를 실물/디스코드로 지급했다면 여기서 승인하세요. 승인 시 보관함에서 카드가 삭제됩니다.</p>  
-    <div class="table-wrap"><table><thead><tr><th>신청자</th><th>카드명</th><th>등급</th><th>신청시각</th><th>작업</th></tr></thead><tbody>  
-      ${rows.map(r=>`<tr>  
-        <td>${esc(state.users[r.uid]?state.users[r.uid].displayName:r.uid)}</td><td>${esc(r.name)}</td>  
-        <td><span class="badge ${r.rarity}">${rarityLabel(r.rarity)}</span></td><td>${kst(r.claimRequestedAt)}</td>  
-        <td>  
+    <div class="muted" style="margin-bottom:10px;">확률 합계: <b style="color:${Math.abs(probSum-100)<0
+   <td>  
           <button class="btn sm mint" onclick="approveClaim('${r.uid}','${r.itemId}','${r.id}','${esc(r.name)}')">승인(지급완료)</button>  
           <button class="btn sm danger" onclick="rejectClaim('${r.uid}','${r.itemId}','${r.id}')">반려</button>  
         </td>  
