@@ -373,7 +373,8 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";  
 import {  
   getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc, addDoc, collection, collectionGroup,  
-  query, where, orderBy, limit, startAfter, onSnapshot, runTransaction, serverTimestamp, getDocs, writeBatch  
+  query, where, orderBy, limit, startAfter, onSnapshot, runTransaction, serverTimestamp, getDocs, writeBatch,  
+  increment, deleteField  
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";  
 const firebaseConfig = {  
   apiKey: "AIzaSyAn3dvdFKvnLm5hntykbeNYeGK-36VrLeY",
@@ -403,8 +404,8 @@ if(CONFIG_READY){
    3) Settings(톱니바퀴) > Upload > Upload presets > Add upload preset  
       - Signing Mode를 반드시 "Unsigned"로 설정 후 저장, preset 이름 확인  
    4) 아래 두 값을 본인 것으로 교체 */  
-const CLOUDINARY_CLOUD_NAME = "wq2gdpsb";  
-const CLOUDINARY_UPLOAD_PRESET = "u9waoc4z";  
+const CLOUDINARY_CLOUD_NAME = "YOUR_CLOUD_NAME";  
+const CLOUDINARY_UPLOAD_PRESET = "YOUR_UPLOAD_PRESET";  
 const CLOUDINARY_READY = CLOUDINARY_CLOUD_NAME !== "YOUR_CLOUD_NAME" && CLOUDINARY_UPLOAD_PRESET !== "YOUR_UPLOAD_PRESET";  
   
 /* ---------------- utils ---------------- */  
@@ -419,6 +420,34 @@ function kst(ts){
   }catch(e){ return '-'; }  
 }  
 function tsMillis(ts){ try{ return ts && ts.toDate ? ts.toDate().getTime() : (ts?new Date(ts).getTime():0); }catch(e){ return 0; } }  
+  
+/* ---------------- 공개 데이터 localStorage 캐시 ----------------  
+   FIRESTORE READ OPTIMIZATION:  
+   cardPacks/products/notices는 모든 사용자에게 동일한 "공개 데이터"라서  
+   접속할 때마다 Firestore에서 반복해서 읽을 필요가 없다. Firestore  
+   Timestamp 객체는 JSON으로 직렬화하면 toDate()가 없는 일반 객체가  
+   되어버리므로, 캐시에 저장하기 전에 밀리초(number)로 미리 변환해둔다.  
+   kst()/tsMillis()는 원래부터 "toDate가 없으면 new Date(ts)로 처리"하는  
+   구조라 number를 넣어도 그대로 정상 동작한다(별도 수정 불필요). */  
+function serializeTimestamps(obj){  
+  const out = {};  
+  for(const k in obj){  
+    const v = obj[k];  
+    out[k] = (v && typeof v.toDate === 'function') ? v.toDate().getTime() : v;  
+  }  
+  return out;  
+}  
+const PUBLIC_CACHE_KEY = 'pgs_public_cache_v1';  
+function readPublicCache(){  
+  try{  
+    const raw = localStorage.getItem(PUBLIC_CACHE_KEY);  
+    if(!raw) return null;  
+    return JSON.parse(raw);  
+  }catch(e){ return null; }  
+}  
+function writePublicCache(cache){  
+  try{ localStorage.setItem(PUBLIC_CACHE_KEY, JSON.stringify(cache)); }catch(e){}  
+}  
 function toast(msg, kind){  
   const wrap = document.getElementById('toastWrap');  
   const el = document.createElement('div');  
@@ -536,7 +565,8 @@ function wireUploadField(fieldId, draft, key, folder){
 const state = {  
   user:null, authUid:null, users:{}, cardPacks:[], products:[], notices:[], settings:{},  
   inventory:[], drawLogs:[], coinLedgers:[], auditLogs:[], admins:[], claims:[], chargeRequests:[],  
-  currentPackId:null, unsub:[]  
+  currentPackId:null, unsub:[],  
+  _packStockCache:{}, _adminProductStockLoadedFor:null // FIRESTORE READ OPTIMIZATION: 관리자 화면용 실시간 재고 캐시  
 };  
 function clearSubs(){  
   state.unsub.forEach(f=>{ try{f();}catch(e){} }); state.unsub=[];  
@@ -623,35 +653,61 @@ function stopInactivityWatcher(){
   if(inactivityTimerId){ clearInterval(inactivityTimerId); inactivityTimerId = null; }  
 }  
   
-/* ---------------- data loading (공개 데이터: 실시간 구독 대신 1회 조회 + 캐시) ----------------  
-   cardPacks / products / notices / siteSettings 는 모든 접속자에게 실시간으로  
-   push될 필요가 없는 데이터이므로, 로그인/로그아웃(auth 상태 변경) 시점에  
-   딱 1번만 getDocs/getDoc으로 불러와 state에 캐싱한다. 이후 화면 이동에서는  
-   재조회하지 않고 캐시된 state를 그대로 사용하며, 관리자가 데이터를 수정한  
-   경우에만 해당 컬렉션을 다시 불러온다(reloadCardPacks/reloadProducts/  
-   reloadNotices/reloadSettings). 뽑기 시 재고 정확성은 이 캐시와 무관하게  
-   runTransaction()이 Firestore 최신 문서를 직접 읽어 보장한다. */  
+/* ---------------- data loading (공개 데이터: 버전 기반 localStorage 캐시) ----------------  
+   FIRESTORE READ OPTIMIZATION (①):  
+   cardPacks/products/notices는 모든 접속자에게 동일한 "공개 데이터"다.  
+   이전에는 로그인/새로고침마다 이 3개 컬렉션을 무조건 전부 getDocs()로  
+   다시 읽었는데, 이는 접속자 수 × 상품 수만큼 Read가 비례해서 늘어나는  
+   구조였다. 이제는 siteSettings/config 문서 "1개"만 먼저 읽어서 그 안의  
+   dataVersion 필드를 확인하고, 로컬(localStorage)에 캐시된 버전과 같으면  
+   cardPacks/products/notices는 아예 다시 읽지 않는다. 버전이 다를 때만  
+   (=관리자가 실제로 데이터를 바꿨을 때만) 전체를 다시 읽고 캐시를 최신화한다.  
+   → 접속자가 아무리 많아져도, 데이터가 안 바뀌는 한 매 세션 Read는  
+     "siteSettings 문서 1개"로 고정된다. */  
+let publicDataPromise = null; // 중복 호출 방지(Promise 캐싱): 동시에 여러 곳에서 호출돼도 Read는 1세트만 발생  
 async function loadPublicData(){  
-  try{  
-    const [packSnap, prodSnap, noticeSnap, settingsSnap] = await Promise.all([  
-      getDocs(query(collection(db,'cardPacks'), orderBy('sortOrder','asc'))),  
-      getDocs(collection(db,'products')),  
-      getDocs(collection(db,'notices')),  
-      getDoc(doc(db,'siteSettings','config'))  
-    ]);  
-    state.cardPacks = packSnap.docs.map(d=>({id:d.id, ...d.data()}));  
-    state.products = prodSnap.docs.map(d=>({id:d.id, ...d.data()}));  
-    state.notices = noticeSnap.docs.map(d=>({id:d.id, ...d.data()}));  
-    if(settingsSnap.exists()){  
-      state.settings = settingsSnap.data();  
-    } else {  
-      state.settings = {siteName:'Pokemon Gacha Shop', maintenanceMode:false, logoUrl:'', defaultImageUrl:''};  
-      setDoc(doc(db,'siteSettings','config'), state.settings).catch(()=>{});  
+  if(publicDataPromise) return publicDataPromise;  
+  publicDataPromise = (async ()=>{  
+    try{  
+      const settingsSnap = await getDoc(doc(db,'siteSettings','config')); // 항상 1회 Read (매우 저렴)  
+      let settings;  
+      if(settingsSnap.exists()){  
+        settings = settingsSnap.data();  
+      } else {  
+        settings = {siteName:'Pokemon Gacha Shop', maintenanceMode:false, logoUrl:'', defaultImageUrl:'', dataVersion:0};  
+        await setDoc(doc(db,'siteSettings','config'), settings).catch(()=>{});  
+      }  
+      const remoteVersion = settings.dataVersion || 0;  
+      const cache = readPublicCache();  
+      if(cache && cache.version===remoteVersion && Array.isArray(cache.cardPacks) && Array.isArray(cache.products) && Array.isArray(cache.notices)){  
+        // FIRESTORE READ OPTIMIZATION: 캐시 버전이 일치 → cardPacks/products/notices Read 자체를 생략  
+        state.cardPacks = cache.cardPacks;  
+        state.products = cache.products;  
+        state.notices = cache.notices;  
+      } else {  
+        // 캐시가 없거나(최초 접속) 관리자가 데이터를 바꿔 버전이 달라진 경우에만 전체 재조회  
+        const [packSnap, prodSnap, noticeSnap] = await Promise.all([  
+          getDocs(query(collection(db,'cardPacks'), orderBy('sortOrder','asc'))),  
+          getDocs(collection(db,'products')),  
+          getDocs(collection(db,'notices')),  
+        ]);  
+        state.cardPacks = packSnap.docs.map(d=>({id:d.id, ...d.data()}));  
+        state.products = prodSnap.docs.map(d=>({id:d.id, ...d.data()}));  
+        state.notices = noticeSnap.docs.map(d=>({id:d.id, ...d.data()}));  
+        writePublicCache({  
+          version: remoteVersion,  
+          cardPacks: state.cardPacks.map(serializeTimestamps),  
+          products: state.products.map(serializeTimestamps),  
+          notices: state.notices.map(serializeTimestamps),  
+        });  
+      }  
+      state.settings = settings;  
+    }catch(e){  
+      console.warn('loadPublicData error', e);  
     }  
-  }catch(e){  
-    console.warn('loadPublicData error', e);  
-  }  
-  render();  
+    render();  
+  })();  
+  try{ await publicDataPromise; } finally { publicDataPromise = null; }  
 }  
 async function reloadCardPacks(){  
   const snap = await getDocs(query(collection(db,'cardPacks'), orderBy('sortOrder','asc')));  
@@ -669,15 +725,43 @@ async function reloadSettings(){
   const snap = await getDoc(doc(db,'siteSettings','config'));  
   state.settings = snap.exists() ? snap.data() : state.settings;  
 }  
-function subscribeUserData(uidVal){  
-  /* 본인 users/{uid} 문서는 단일 문서 리스너라 비용이 낮고, 관리자가 코인을  
-     충전/차감했을 때 사용자 화면에 즉시 반영되는 가치가 커서 그대로 유지한다.  
-     (요청하신 최적화 최우선순위 목록에도 이 항목은 포함되어 있지 않음) */  
-  state.unsub.push(onSnapshot(doc(db,'users',uidVal), snap=>{  
-    if(!snap.exists()) return;  
-    state.user = {uid:snap.id, ...snap.data()};  
-    scheduleRender();  
-  }));  
+// FIRESTORE READ OPTIMIZATION (관리자 전용):  
+// 관리자가 상품/카드팩/공지를 수정한 직후 호출한다. 이미 최신 상태인  
+// state.cardPacks/products/notices를 그대로 localStorage 캐시에 반영하고  
+// (추가 Read 없음) siteSettings.dataVersion을 원자적으로 1 증가시킨다.  
+// 다른 사용자들은 다음 접속 때 이 버전을 보고 스스로 캐시를 갱신한다.  
+async function bumpDataVersion(){  
+  try{  
+    await updateDoc(doc(db,'siteSettings','config'), {dataVersion: increment(1)});  
+    state.settings.dataVersion = (state.settings.dataVersion||0) + 1; // 로컬 낙관적 반영  
+  }catch(e){ console.warn('bumpDataVersion failed', e); }  
+}  
+async function refreshPublicCacheAndBumpVersion(){  
+  await bumpDataVersion();  
+  writePublicCache({  
+    version: state.settings.dataVersion || 0,  
+    cardPacks: state.cardPacks.map(serializeTimestamps),  
+    products: state.products.map(serializeTimestamps),  
+    notices: state.notices.map(serializeTimestamps),  
+  });  
+}  
+// FIRESTORE READ OPTIMIZATION (④의 연장 - 사용자 문서):  
+// users/{uid} 문서를 onSnapshot으로 실시간 구독하지 않는다. 로그인 시  
+// 딱 1회만 읽고, 이후 코인/프로필이 바뀌는 모든 동작(뽑기, 판매, 프로필  
+// 수정 등)은 Firestore 쓰기 결과를 그대로 로컬 state.user에 반영해서  
+// 화면을 즉시 갱신한다. 실제 잔액 검증은 여전히 Transaction이 Firestore  
+// 최신 문서를 직접 읽어서 하기 때문에 보안은 그대로 유지된다. 다만 다른  
+// 기기/관리자가 이 계정의 코인을 바꾼 경우, 이 세션이 즉시 그 변화를  
+// 보지는 못하고 다음 로그인/새로고침 때 반영된다(요청하신 우선순위:  
+// 단순 UI 실시간성보다 Read 절감).  
+async function loadUserData(uidVal){  
+  try{  
+    const snap = await getDoc(doc(db,'users',uidVal));  
+    if(snap.exists()) state.user = {uid:snap.id, ...snap.data()};  
+  }catch(e){  
+    console.warn('loadUserData error', e);  
+  }  
+  render();  
 }  
 /* 사용자별 drawLogs는 더 이상 실시간 구독하지 않는다. 뽑기 이력 페이지 진입  
    시에만 1회 getDocs로 불러오고(loadUserDrawLogs), 뽑기 직후에는 방금 얻은  
@@ -802,7 +886,7 @@ function onAuthStateChangedSafe(){
     state.authUid = u ? u.uid : null;  
     loadPublicData();  
     if(u){  
-      subscribeUserData(u.uid);  
+      loadUserData(u.uid); // FIRESTORE READ OPTIMIZATION: onSnapshot 대신 로그인 시 1회만 읽는다  
       startInactivityWatcher();  
     } else {  
       stopInactivityWatcher();  
@@ -1039,7 +1123,19 @@ window.selectPack = function(packId){
 };  
   
 /* ---------------- Draw (Firestore transaction) ---------------- */  
+// FIRESTORE READ OPTIMIZATION (②③):  
+// 예전 구조는 뽑힌 상품 개수만큼 Transaction 안에서 products/{id} 문서를  
+// 각각 tx.get()으로 읽었다(10연속 뽑기 = 최대 10회 상품 Read + 재시도마다  
+// 반복). 이제는 카드팩 하나당 재고 정보를 통째로 담은 packStocks/{packId}  
+// 문서 "1개"만 읽는다. 상품의 이름/이미지/등급/설명/확률 같은 "공개 데이터"는  
+// 이미 클라이언트가 캐시(state.products)로 갖고 있으므로 Transaction에서  
+// 다시 읽지 않고, 실제 정합성이 필요한 "재고"만 packStocks에서 검증한다.  
+// → Transaction 1회당 Read는 항상 {user 1개 + packStock 1개} = 2개로 고정.  
+//   뽑는 개수(1/5/10)나 상품 가짓수와 무관하다. 재시도가 여러 번 발생해도  
+//   매번 딱 2개 문서만 다시 읽으므로 동시 접속자가 늘어도 Read가 폭증하지 않는다.  
+let _drawing = false; // 중복 호출 방지: 버튼 연타로 같은 뽑기가 중복 실행되지 않도록 한다  
 window.doDraw = async function(count){  
+  if(_drawing) return;  
   const u = state.user;  
   const packId = state.currentPackId;  
   const pack = state.cardPacks.find(p=>p.id===packId);  
@@ -1047,97 +1143,112 @@ window.doDraw = async function(count){
   const priceMap = {1:pack.drawPrice1, 5:pack.drawPrice5, 10:pack.drawPrice10};  
   const price = priceMap[count];  
   if(u.coin < price) return toast('코인이 부족합니다.','err');  
-  const candidateProducts = state.products.filter(p=>p.cardPackId===packId && p.status==='ACTIVE' && !p.forceSoldOut && p.currentStock>0);  
+  const candidateProducts = state.products.filter(p=>p.cardPackId===packId && p.status==='ACTIVE');  
   if(candidateProducts.length===0) return toast('뽑을 수 있는 상품이 없습니다.','err');  
   
+  _drawing = true;  
   const maxAttempts = 4;  
   let lastErr = null;  
-  for(let attempt=0; attempt<maxAttempts; attempt++){  
-    try{  
-      const drawn = await runTransaction(db, async (tx)=>{  
-        const userRef = doc(db,'users',u.uid);  
-        const userSnap = await tx.get(userRef);  
-        const userData = userSnap.data();  
-        if(!userData || userData.coin < price) throw new Error('INSUFFICIENT_COIN');  
-        // 화면에 캐시된 재고/확률 정보로 먼저 확률 추첨을 진행하고, 트랜잭션 안에서는  
-        // 실제로 뽑힌 상품 문서만 읽고 검증한다. (모든 활성 상품을 매번 읽고 쓰면  
-        // 동시에 뽑기를 하는 다른 유저들과 문서가 겹쳐 트랜잭션 충돌이 잦아지는 원인이 된다)  
-        let pool = candidateProducts.map(p=>({...p}));  
-        const picks = [];  
-        for(let i=0;i<count;i++){  
-          if(pool.length===0) break;  
-          const totalWeight = pool.reduce((s,p)=>s+Number(p.probability),0) || 1;  
-          let r = Math.random()*totalWeight;  
-          let picked = pool[pool.length-1];  
-          for(const p of pool){ if(r < p.probability){ picked=p; break; } r -= p.probability; }  
-          picks.push(picked.id);  
-          picked.currentStock -= 1;  
-          if(picked.currentStock<=0) pool = pool.filter(p=>p.id!==picked.id);  
-        }  
-        if(picks.length===0) throw new Error('NO_STOCK');  
+  try{  
+    for(let attempt=0; attempt<maxAttempts; attempt++){  
+      try{  
+        const drawn = await runTransaction(db, async (tx)=>{  
+          const userRef = doc(db,'users',u.uid);  
+          const stockRef = doc(db,'packStocks',packId);  
+          // Firestore 트랜잭션 규칙: 모든 tx.get()은 tx.set()/tx.update()보다 먼저 호출되어야 한다.  
+          const userSnap = await tx.get(userRef);  
+          const stockSnap = await tx.get(stockRef); // 상품 개수와 무관하게 항상 딱 1회 Read  
+          const userData = userSnap.data();  
+          if(!userData || userData.coin < price) throw new Error('INSUFFICIENT_COIN');  
   
-        const uniqueIds = [...new Set(picks)];  
-        const productSnaps = {};  
-        for(const pid of uniqueIds){  
-          productSnaps[pid] = await tx.get(doc(db,'products',pid));  
-        }  
+          const stocks = stockSnap.exists() ? (stockSnap.data().stocks || {}) : {};  
   
-        const results = [];  
-        const stockDelta = {};  
-        for(const pid of picks){  
-          const snap = productSnaps[pid];  
-          const data = snap.exists() ? snap.data() : null;  
-          const already = stockDelta[pid] || 0;  
-          if(!data || data.status!=='ACTIVE' || data.forceSoldOut || (data.currentStock - already) <= 0) continue;  
-          stockDelta[pid] = already + 1;  
-          results.push({id:pid, ...data});  
+          // 화면에 캐시된 확률/이름/이미지 정보로 추첨하되, 실제 재고는 방금 읽은  
+          // stocks(서버 진짜 값)로만 판단한다. stocks에 아직 없는 상품(과거  
+          // 데이터, packStocks 마이그레이션 이전)은 클라이언트 캐시의 현재  
+          // 재고값으로 이번에 최초 1회만 시드한다.  
+          let pool = candidateProducts  
+            .map(p=>{  
+              const s = stocks[p.id];  
+              return s  
+                ? {...p, currentStock: s.stock, forceSoldOut: !!s.forceSoldOut}  
+                : {...p, currentStock: p.currentStock||0, forceSoldOut: !!p.forceSoldOut};  
+            })  
+            .filter(p=>!p.forceSoldOut && p.currentStock>0);  
+          if(pool.length===0) throw new Error('NO_STOCK');  
+  
+          const picks = [];  
+          const stockDelta = {};  
+          for(let i=0;i<count;i++){  
+            if(pool.length===0) break;  
+            const totalWeight = pool.reduce((s,p)=>s+Number(p.probability),0) || 1;  
+            let r = Math.random()*totalWeight;  
+            let picked = pool[pool.length-1];  
+            for(const p of pool){ if(r < p.probability){ picked=p; break; } r -= p.probability; }  
+            picks.push(picked);  
+            stockDelta[picked.id] = (stockDelta[picked.id]||0) + 1;  
+            picked.currentStock -= 1;  
+            if(picked.currentStock<=0) pool = pool.filter(p=>p.id!==picked.id);  
+          }  
+          if(picks.length===0) throw new Error('NO_STOCK');  
+  
+          // packStocks 문서 "1개"만 merge로 갱신한다(상품 수만큼 문서를 따로 쓰지 않는다).  
+          // merge:true라서 문서가 아예 없던 경우/일부 상품만 시드되어 있던 경우  
+          // 모두 안전하게 처리된다(없으면 새로 생성, 있으면 해당 필드만 갱신).  
+          const patch = {updatedAt: serverTimestamp()};  
+          Object.keys(stockDelta).forEach(pid=>{  
+            const before = stocks[pid] ? stocks[pid].stock : (candidateProducts.find(p=>p.id===pid)?.currentStock || 0);  
+            const forceSoldOut = stocks[pid] ? !!stocks[pid].forceSoldOut : false;  
+            patch[`stocks.${pid}`] = {stock: before - stockDelta[pid], forceSoldOut};  
+          });  
+          tx.set(stockRef, patch, {merge:true});  
+  
+          const newCoin = userData.coin - price;  
+          tx.update(userRef, {coin:newCoin, updatedAt:serverTimestamp()});  
+          const ledgerRef = doc(collection(db,'coinLedgers'));  
+          tx.set(ledgerRef, {uid:u.uid, type:'DRAW', beforeCoin:userData.coin, changeCoin:-price, afterCoin:newCoin,  
+            memo:`${pack.name} ${count}회 뽑기`, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
+          picks.forEach(rItem=>{  
+            const itemRef = doc(collection(db,'inventories',u.uid,'items'));  
+            tx.set(itemRef, {productId:rItem.id, cardPackId:packId, name:rItem.name, imageUrl:rItem.imageUrl||'', rarity:rItem.rarity,  
+              sellCoin:rItem.sellCoin, isFavorite:false, isLocked:false, isNew:true, status:'ACTIVE',  
+              obtainedAt: serverTimestamp(), obtainedAtKST: kstNow()});  
+          });  
+          const logRef = doc(collection(db,'drawLogs'));  
+          const logData = {uid:u.uid, displayName:userData.displayName, cardPackId:packId, cardPackName:pack.name,  
+            drawType:`${count}연속`, results:picks.map(rr=>({productId:rr.id,name:rr.name,rarity:rr.rarity,imageUrl:rr.imageUrl||''})),  
+            usedCoin:price, createdAt:serverTimestamp(), createdAtKST:kstNow()};  
+          tx.set(logRef, logData);  
+          return {results:picks, logId:logRef.id, logData, stockDelta, newCoin};  
+        });  
+        // FIRESTORE READ OPTIMIZATION: Firestore를 다시 읽지 않고, 방금 트랜잭션이  
+        // 반환한 값으로 코인/재고를 로컬 state에 바로 반영한다(onSnapshot 없이도  
+        // 화면이 즉시 갱신된다). 실제 검증은 이미 위 Transaction에서 끝난 상태다.  
+        state.user.coin = drawn.newCoin;  
+        Object.keys(drawn.stockDelta).forEach(pid=>{  
+          const prod = state.products.find(pp=>pp.id===pid);  
+          if(prod) prod.currentStock = Math.max(0, (prod.currentStock||0) - drawn.stockDelta[pid]);  
+        });  
+        if(state._drawLogsLoaded){  
+          state.drawLogs.unshift({id:drawn.logId, ...drawn.logData, createdAt:new Date()});  
         }  
-        if(results.length===0) throw new Error('NO_STOCK');  
-        Object.keys(stockDelta).forEach(pid=>{  
-          const before = productSnaps[pid].data().currentStock;  
-          tx.update(doc(db,'products',pid), {currentStock: before - stockDelta[pid], updatedAt: serverTimestamp()});  
-        });  
-        const newCoin = userData.coin - price;  
-        tx.update(userRef, {coin:newCoin, updatedAt:serverTimestamp()});  
-        const ledgerRef = doc(collection(db,'coinLedgers'));  
-        tx.set(ledgerRef, {uid:u.uid, type:'DRAW', beforeCoin:userData.coin, changeCoin:-price, afterCoin:newCoin,  
-          memo:`${pack.name} ${count}회 뽑기`, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
-        results.forEach(rItem=>{  
-          const itemRef = doc(collection(db,'inventories',u.uid,'items'));  
-          tx.set(itemRef, {productId:rItem.id, cardPackId:packId, name:rItem.name, imageUrl:rItem.imageUrl||'', rarity:rItem.rarity,  
-            sellCoin:rItem.sellCoin, isFavorite:false, isLocked:false, isNew:true, status:'ACTIVE',  
-            obtainedAt: serverTimestamp(), obtainedAtKST: kstNow()});  
-        });  
-        const logRef = doc(collection(db,'drawLogs'));  
-        const logData = {uid:u.uid, displayName:userData.displayName, cardPackId:packId, cardPackName:pack.name,  
-          drawType:`${count}연속`, results:results.map(rr=>({productId:rr.id,name:rr.name,rarity:rr.rarity,imageUrl:rr.imageUrl||''})),  
-          usedCoin:price, createdAt:serverTimestamp(), createdAtKST:kstNow()};  
-        tx.set(logRef, logData);  
-        return {results, logId:logRef.id, logData, stockDelta};  
-      });  
-      // Firestore를 다시 읽지 않고, 방금 뽑기 결과로 로컬 state만 낙관적으로 갱신한다.  
-      // (화면에 보이는 재고는 약간의 지연이 있을 수 있으나, 실제 뽑기 검증은 항상  
-      //  위 runTransaction()이 최신 Firestore 문서를 기준으로 처리하므로 정확성에는 영향 없음)  
-      Object.keys(drawn.stockDelta).forEach(pid=>{  
-        const prod = state.products.find(pp=>pp.id===pid);  
-        if(prod) prod.currentStock = Math.max(0, (prod.currentStock||0) - drawn.stockDelta[pid]);  
-      });  
-      if(state._drawLogsLoaded){  
-        state.drawLogs.unshift({id:drawn.logId, ...drawn.logData, createdAt:new Date()});  
+        render();  
+        showDrawReveal(drawn.results, pack);  
+        return;  
+      }catch(e){  
+        lastErr = e;  
+        if(e.message==='INSUFFICIENT_COIN' || e.message==='NO_STOCK') break;  
+        await new Promise(res=>setTimeout(res, 250 + attempt*250));  
       }  
-      showDrawReveal(drawn.results, pack);  
-      return;  
-    }catch(e){  
-      lastErr = e;  
-      if(e.message==='INSUFFICIENT_COIN' || e.message==='NO_STOCK') break;  
-      await new Promise(res=>setTimeout(res, 250 + attempt*250));  
     }  
+    console.error(lastErr);  
+    if(lastErr && lastErr.message==='INSUFFICIENT_COIN') toast('코인이 부족합니다.','err');  
+    else if(lastErr && lastErr.message==='NO_STOCK') toast('재고가 부족합니다.','err');  
+    else if(lastErr && lastErr.code==='resource-exhausted') toast('Firebase 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요.','err');  
+    else toast('다른 유저와 요청이 겹쳐 처리가 지연되었습니다. 다시 시도해주세요.','err');  
+  } finally {  
+    _drawing = false;  
   }  
-  console.error(lastErr);  
-  if(lastErr && lastErr.message==='INSUFFICIENT_COIN') toast('코인이 부족합니다.','err');  
-  else if(lastErr && lastErr.message==='NO_STOCK') toast('재고가 부족합니다.','err');  
-  else if(lastErr && lastErr.code==='resource-exhausted') toast('Firebase 사용량 한도를 초과했습니다. 잠시 후 다시 시도해주세요.','err');  
-  else toast('다른 유저와 요청이 겹쳐 처리가 지연되었습니다. 다시 시도해주세요.','err');  
 };  
   
 /* ---------------- Draw reveal (drag-to-uncover mask) ---------------- */  
@@ -1341,27 +1452,41 @@ window.setInvRarity = (r)=>{ invFilter.rarity=r; resetInvPage(); };
 window.toggleFav = (itemId)=>{ updateInvItem(itemId, {isFavorite: !getInvItem(itemId).isFavorite}); };  
 window.toggleLock = (itemId)=>{ updateInvItem(itemId, {isLocked: !getInvItem(itemId).isLocked}); };  
 function getInvItem(itemId){ return state.inventory.find(i=>i.id===itemId); }  
+// FIRESTORE READ OPTIMIZATION (④):  
+// 즐겨찾기/잠금 토글마다 updateDoc().then(refreshInvPage())로 같은  
+// 인벤토리 페이지를 Firestore에서 통째로 다시 읽던 구조를 제거했다.  
+// 이제는 Firestore에 쓰기만 하고, 성공하면 로컬 state.inventory의  
+// 해당 아이템만 바로 수정해 화면에 반영한다(재조회 Read 0회).  
 function updateInvItem(itemId, patch){  
   updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {...patch, isNew:false})  
-    .then(()=>refreshInvPage())  
+    .then(()=>{  
+      const item = getInvItem(itemId);  
+      if(item) Object.assign(item, patch, {isNew:false});  
+      render();  
+    })  
     .catch(e=>toast('처리 실패','err'));  
 }  
 window.sellItem = async (itemId)=>{  
   const item = getInvItem(itemId);  
   if(!item || item.isLocked) return;  
   try{  
-    await runTransaction(db, async(tx)=>{  
+    const newCoin = await runTransaction(db, async(tx)=>{  
       const userRef = doc(db,'users',state.user.uid);  
       const userSnap = await tx.get(userRef);  
-      const newCoin = userSnap.data().coin + item.sellCoin;  
-      tx.update(userRef, {coin:newCoin, updatedAt:serverTimestamp()});  
+      const nCoin = userSnap.data().coin + item.sellCoin;  
+      tx.update(userRef, {coin:nCoin, updatedAt:serverTimestamp()});  
       tx.update(doc(db,'inventories',state.user.uid,'items',itemId), {status:'SOLD'});  
       const ledgerRef = doc(collection(db,'coinLedgers'));  
-      tx.set(ledgerRef, {uid:state.user.uid, type:'SELL', beforeCoin:userSnap.data().coin, changeCoin:item.sellCoin, afterCoin:newCoin,  
+      tx.set(ledgerRef, {uid:state.user.uid, type:'SELL', beforeCoin:userSnap.data().coin, changeCoin:item.sellCoin, afterCoin:nCoin,  
         memo:`${item.name} 즉시판매`, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
+      return nCoin;  
     });  
+    // FIRESTORE READ OPTIMIZATION: 판매 후 인벤토리를 재조회하지 않고,  
+    // 트랜잭션이 돌려준 새 코인 잔액과 로컬 목록에서의 아이템 제거만으로 화면을 갱신한다.  
+    state.user.coin = newCoin;  
+    state.inventory = state.inventory.filter(i=>i.id!==itemId);  
+    render();  
     toast(`${item.name} 판매 완료`, 'ok');  
-    refreshInvPage();  
   }catch(e){ toast('판매 처리 중 오류가 발생했습니다.','err'); }  
 };  
 window.requestClaim = async (itemId)=>{  
@@ -1373,14 +1498,19 @@ window.requestClaim = async (itemId)=>{
       if(!snap.exists()) throw new Error('NOT_FOUND');  
       const data = snap.data();  
       if(data.status!=='ACTIVE') throw new Error('INVALID_STATUS');  
-      tx.update(itemRef, {status:'CLAIM_REQUESTED', claimRequestedAt: serverTimestamp()});  
+      // claimRequestId를 인벤토리 아이템에도 같이 저장해두면, 취소할 때  
+      // claimRequests 컬렉션을 검색(getDocs)하지 않고 바로 그 문서를 지울 수 있다.  
+      tx.update(itemRef, {status:'CLAIM_REQUESTED', claimRequestedAt: serverTimestamp(), claimRequestId: claimRef.id});  
       tx.set(claimRef, {  
         uid: state.user.uid, itemId, name: data.name||'', rarity: data.rarity||'',  
         status:'PENDING', claimRequestedAt: serverTimestamp(), claimRequestedAtKST: kstNow()  
       });  
     });  
+    // FIRESTORE READ OPTIMIZATION: 재조회 없이 로컬 아이템 상태만 갱신  
+    const item = getInvItem(itemId);  
+    if(item){ item.status = 'CLAIM_REQUESTED'; item.claimRequestId = claimRef.id; }  
+    render();  
     toast('수령 신청이 접수되었습니다.','ok');  
-    refreshInvPage();  
   }catch(e){  
     console.error('requestClaim error', e);  
     if(e.message==='NOT_FOUND') toast('아이템을 찾을 수 없습니다.','err');  
@@ -1391,11 +1521,19 @@ window.requestClaim = async (itemId)=>{
 };  
 window.cancelClaim = async (itemId)=>{  
   try{  
-    await updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'ACTIVE', claimRequestedAt:null});  
-    const snap = await getDocs(query(collection(db,'claimRequests'), where('uid','==',state.user.uid), where('itemId','==',itemId), where('status','==','PENDING')));  
-    await Promise.all(snap.docs.map(d=>deleteDoc(doc(db,'claimRequests',d.id))));  
+    const item = getInvItem(itemId);  
+    await updateDoc(doc(db,'inventories',state.user.uid,'items',itemId), {status:'ACTIVE', claimRequestedAt:null, claimRequestId:null});  
+    if(item && item.claimRequestId){  
+      // FIRESTORE READ OPTIMIZATION: claimRequestId를 이미 알고 있으므로 검색(getDocs) 없이 바로 삭제한다.  
+      await deleteDoc(doc(db,'claimRequests', item.claimRequestId)).catch(()=>{});  
+    } else {  
+      // 이 최적화 적용 이전에 생성된 데이터(claimRequestId가 없는 경우)를 위한 안전한 대체 경로  
+      const snap = await getDocs(query(collection(db,'claimRequests'), where('uid','==',state.user.uid), where('itemId','==',itemId), where('status','==','PENDING')));  
+      await Promise.all(snap.docs.map(d=>deleteDoc(doc(db,'claimRequests',d.id))));  
+    }  
+    if(item){ item.status = 'ACTIVE'; item.claimRequestId = null; }  
+    render();  
     toast('수령 신청을 취소했습니다.','ok');  
-    refreshInvPage();  
   }catch(e){ toast('처리 실패','err'); }  
 };  
 window.deleteRarityCards = async function(){  
@@ -1403,11 +1541,15 @@ window.deleteRarityCards = async function(){
   const rarity = invFilter.rarity;  
   if(!confirm(`${rarityLabel(rarity)} 등급 카드를 모두 판매할까요? (잠금된 카드는 제외됩니다) 되돌릴 수 없습니다.`)) return;  
   try{  
+    // 이 액션은 페이지네이션 범위를 넘어 "해당 등급 전체"를 대상으로 하는  
+    // 드문 대량 작업이라, 대상 목록을 얻기 위한 이 조회만은 그대로 둔다  
+    // (빈번한 단일 조작인 즐겨찾기/잠금/판매/수령과는 성격이 다르다).  
     const snap = await getDocs(query(collection(db,'inventories',state.user.uid,'items'),  
       where('rarity','==',rarity), where('status','==','ACTIVE')));  
     const targets = snap.docs.filter(d=>!d.data().isLocked);  
     if(targets.length===0){ toast('판매할 카드가 없습니다.','err'); return; }  
     const totalCoin = targets.reduce((s,d)=>s+(d.data().sellCoin||0),0);  
+    const targetIds = new Set(targets.map(d=>d.id));  
     let batch = writeBatch(db);  
     let count = 0;  
     for(const d of targets){  
@@ -1416,7 +1558,7 @@ window.deleteRarityCards = async function(){
       if(count % 400 === 0){ await batch.commit(); batch = writeBatch(db); }  
     }  
     await batch.commit();  
-    await runTransaction(db, async(tx)=>{  
+    const newCoin = await runTransaction(db, async(tx)=>{  
       const userRef = doc(db,'users',state.user.uid);  
       const userSnap = await tx.get(userRef);  
       const before = userSnap.data().coin || 0;  
@@ -1425,9 +1567,15 @@ window.deleteRarityCards = async function(){
       const ledgerRef = doc(collection(db,'coinLedgers'));  
       tx.set(ledgerRef, {uid:state.user.uid, type:'SELL', beforeCoin:before, changeCoin:totalCoin, afterCoin:after,  
         memo:`${rarityLabel(rarity)} 등급 전체 판매 (${count}개)`, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
+      return after;  
     });  
+    // FIRESTORE READ OPTIMIZATION: 코인은 트랜잭션 결과로, 인벤토리 목록은  
+    // 현재 로드된 페이지에서 판매된 항목만 로컬로 제거해 화면을 즉시 갱신한다.  
+    // (다른 페이지에 남아있던 동일 등급 카드는 다음 페이지 이동/새로고침 시 정리된다)  
+    state.user.coin = newCoin;  
+    state.inventory = state.inventory.filter(i=>!targetIds.has(i.id));  
+    render();  
     toast(`${count}개 카드를 판매하여 ${totalCoin} 코인을 받았습니다.`,'ok');  
-    resetInvPage();  
   }catch(e){  
     console.error('deleteRarityCards error', e);  
     toast('판매 중 오류가 발생했습니다.','err');  
@@ -1522,6 +1670,9 @@ function renderProfile(){
       await reserveNickname(newKey, u.uid);  
       await updateDoc(doc(db,'users',u.uid), {displayName:name, displayNameKey:newKey, updatedAt:serverTimestamp(), updatedAtKST:kstNow()});  
       if(oldKey) await deleteDoc(doc(db,'usernames',oldKey)).catch(()=>{});  
+      // FIRESTORE READ OPTIMIZATION: onSnapshot이 없으므로 로컬 state.user를 직접 갱신한다  
+      state.user.displayName = name; state.user.displayNameKey = newKey;  
+      render();  
       toast('닉네임이 변경되었습니다.','ok');  
     }catch(e){  
       if(e.message==='DUP_NAME') toast('이미 사용 중인 닉네임입니다.','err');  
@@ -1727,6 +1878,8 @@ async function submitCoinOp(userUid, type){
     await addAuditLog(type==='CHARGE'?'코인 충전':'코인 차감', userUid, {coin:result.before}, {coin:result.after, memo});  
     // 재조회 없이 로컬 캐시만 갱신(read 절감)  
     if(state.users[userUid]) state.users[userUid] = {...state.users[userUid], coin:result.after};  
+    // onSnapshot이 없으므로, 관리자가 자기 자신의 코인을 조정한 경우 state.user도 함께 동기화한다  
+    if(state.user && state.user.uid===userUid) state.user.coin = result.after;  
     closeModal(); toast('코인이 처리되었습니다.','ok');  
     if(state._coinLedgersLoaded) loadAdminCoinLedgers(); else render();  
   }catch(e){  
@@ -1802,6 +1955,7 @@ window.openPackForm = function(packId){
         await addAuditLog('카드팩 생성', ref.id, null, data);  
       }  
       await reloadCardPacks();  
+      await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
       closeModal(); toast('저장되었습니다.','ok'); render();  
     }catch(e){ toast('저장 중 오류가 발생했습니다.','err'); }  
   };  
@@ -1813,6 +1967,7 @@ window.togglePackStatus = async function(packId){
   await updateDoc(doc(db,'cardPacks',packId), {status:next, updatedAt:serverTimestamp()});  
   await addAuditLog('카드팩 상태변경', packId, {status:before}, {status:next});  
   await reloadCardPacks();  
+  await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
   toast('상태가 변경되었습니다.','ok'); render();  
 };  
 window.duplicatePack = async function(packId){  
@@ -1820,12 +1975,19 @@ window.duplicatePack = async function(packId){
   const {id, ...rest} = src;  
   const ref = await addDoc(collection(db,'cardPacks'), {...rest, name: src.name+' (복제)', sortOrder: state.cardPacks.length+1, createdAt:serverTimestamp(), createdAtKST:kstNow(), updatedAt:serverTimestamp()});  
   const srcProducts = state.products.filter(p=>p.cardPackId===packId);  
+  // FIRESTORE READ OPTIMIZATION: 복제된 상품들의 재고를 packStocks 문서 1개에 함께 시드해둔다  
+  const newStocks = {};  
   for(const sp of srcProducts){  
     const {id:spid, ...prest} = sp;  
-    await addDoc(collection(db,'products'), {...prest, cardPackId:ref.id, createdAt:serverTimestamp(), createdAtKST:kstNow(), updatedAt:serverTimestamp()});  
+    const newRef = await addDoc(collection(db,'products'), {...prest, cardPackId:ref.id, createdAt:serverTimestamp(), createdAtKST:kstNow(), updatedAt:serverTimestamp()});  
+    newStocks[newRef.id] = {stock: prest.currentStock||0, forceSoldOut: !!prest.forceSoldOut};  
+  }  
+  if(Object.keys(newStocks).length>0){  
+    await setDoc(doc(db,'packStocks',ref.id), {stocks:newStocks, updatedAt:serverTimestamp()});  
   }  
   await addAuditLog('카드팩 복제', ref.id, {from:packId}, null);  
   await Promise.all([reloadCardPacks(), reloadProducts()]);  
+  await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
   toast('카드팩이 복제되었습니다.','ok'); render();  
 };  
 window.deleteCardPack = async function(packId, name){  
@@ -1841,8 +2003,10 @@ window.deleteCardPack = async function(packId, name){
     }  
     await batch.commit();  
     await deleteDoc(doc(db,'cardPacks',packId));  
+    await deleteDoc(doc(db,'packStocks',packId)).catch(()=>{}); // 재고 문서도 함께 정리  
     await addAuditLog('카드팩 삭제', packId, {name, deletedProducts:relatedProducts.length}, null);  
     await Promise.all([reloadCardPacks(), reloadProducts()]);  
+    await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
     toast('카드팩이 삭제되었습니다.','ok'); render();  
   }catch(e){  
     console.error('deleteCardPack error', e);  
@@ -1850,15 +2014,38 @@ window.deleteCardPack = async function(packId, name){
   }  
 };  
   
+// FIRESTORE READ OPTIMIZATION (관리자 화면 전용):  
+// 뽑기 Transaction은 이제 products.currentStock을 더 이상 갱신하지 않고  
+// packStocks/{packId} 문서 하나만 갱신한다. 그래서 관리자가 실제 최신  
+// 재고를 정확히 보려면 이 문서를 1회 읽어야 한다. 상품 관리 화면에  
+// "들어오거나 카드팩을 바꿀 때만" 딱 1번 읽고(고객 화면과 무관, 관리자  
+// 트래픽 기준이라 매우 저렴), 이후 같은 카드팩을 계속 보는 동안은  
+// 재조회하지 않는다. "새로고침" 버튼을 누르면 다시 읽는다.  
+async function loadAdminPackStock(packId){  
+  try{  
+    const snap = await getDoc(doc(db,'packStocks',packId));  
+    state._packStockCache[packId] = (snap.exists() ? snap.data().stocks : null) || {};  
+  }catch(e){ console.warn('loadAdminPackStock error', e); }  
+  render();  
+}  
 function adminProducts(c){  
   const packs = state.cardPacks;  
   const filterPack = window._adminProdPack || (packs[0] && packs[0].id) || '';  
   window._adminProdPack = filterPack;  
+  if(filterPack && state._adminProductStockLoadedFor !== filterPack){  
+    state._adminProductStockLoadedFor = filterPack; // 중복 호출 방지  
+    loadAdminPackStock(filterPack);  
+  }  
+  const liveStocks = state._packStockCache[filterPack] || {};  
   const products = state.products.filter(p=>p.cardPackId===filterPack)  
+    .map(p=>{  
+      const live = liveStocks[p.id];  
+      return live ? {...p, currentStock: live.stock, forceSoldOut: !!live.forceSoldOut} : p;  
+    })  
     .sort((a,b)=>(a.sortOrder??0)-(b.sortOrder??0));  
   const probSum = products.reduce((s,p)=>s+Number(p.probability),0);  
   c.innerHTML = `  
-    <div class="admin-topbar"><h1>상품 관리</h1><button class="btn sm" onclick="reloadProducts().then(render)">새로고침</button><button class="btn primary sm" id="pdNewBtn">상품 추가</button></div>  
+    <div class="admin-topbar"><h1>상품 관리</h1><button class="btn sm" onclick="reloadProducts().then(()=>{ state._adminProductStockLoadedFor=null; render(); })">새로고침</button><button class="btn primary sm" id="pdNewBtn">상품 추가</button></div>  
     <div class="field"><select id="pdPackSel">  
       ${packs.map(p=>`<option value="${p.id}" ${p.id===filterPack?'selected':''}>${esc(p.name)}</option>`).join('')}  
     </select></div>  
@@ -1895,6 +2082,7 @@ window.moveProduct = async function(productId, direction){
     await batch.commit();  
     await addAuditLog('상품 순서 변경', productId, null, {direction});  
     await reloadProducts();  
+    await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 정렬 순서도 공개 데이터라 캐시 버전을 올린다  
     render();  
   }catch(e){  
     console.error('moveProduct error', e);  
@@ -1936,13 +2124,20 @@ window.openProductForm = function(productId, packId){
       if(productId){  
         const before = {...state.products.find(x=>x.id===productId)};  
         await updateDoc(doc(db,'products',productId), {...data, currentStock:stock});  
+        // FIRESTORE READ OPTIMIZATION: 뽑기는 packStocks만 보므로, 관리자가 재고를  
+        // 수정하면 packStocks의 해당 상품 값도 함께 갱신해 실제 뽑기에도 반영되게 한다.  
+        await setDoc(doc(db,'packStocks',packId), {[`stocks.${productId}`]: {stock, forceSoldOut: before.forceSoldOut||false}, updatedAt:serverTimestamp()}, {merge:true});  
         await addAuditLog('상품 수정', productId, before, data);  
       } else {  
         const newSortOrder = state.products.filter(x=>x.cardPackId===packId).length;  
         const ref = await addDoc(collection(db,'products'), {...data, cardPackId:packId, status:'ACTIVE', forceSoldOut:false, initialStock:stock, currentStock:stock, sortOrder:newSortOrder, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
+        // FIRESTORE READ OPTIMIZATION: 새 상품의 재고를 packStocks 문서에도 함께 시드한다  
+        await setDoc(doc(db,'packStocks',packId), {[`stocks.${ref.id}`]: {stock, forceSoldOut:false}, updatedAt:serverTimestamp()}, {merge:true});  
         await addAuditLog('상품 생성', ref.id, null, data);  
       }  
       await reloadProducts();  
+      state._adminProductStockLoadedFor = null; // 다음 렌더에서 packStocks도 다시 반영  
+      await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
       closeModal(); toast('저장되었습니다.','ok'); render();  
     }catch(e){ toast('저장 중 오류가 발생했습니다.','err'); }  
   };  
@@ -1951,9 +2146,15 @@ window.toggleForceSoldOut = async function(productId){
   const p = state.products.find(x=>x.id===productId);  
   const before = p.forceSoldOut;  
   await updateDoc(doc(db,'products',productId), {forceSoldOut: !before, updatedAt:serverTimestamp()});  
+  // FIRESTORE READ OPTIMIZATION: 뽑기가 참조하는 packStocks에도 강제품절 여부를 함께 반영  
+  await setDoc(doc(db,'packStocks',p.cardPackId), {[`stocks.${productId}.forceSoldOut`]: !before}, {merge:true});  
   await addAuditLog('강제품절 토글', productId, {forceSoldOut:before}, {forceSoldOut:!before});  
   // 재조회 없이 로컬 캐시만 갱신(read 절감)  
   p.forceSoldOut = !before;  
+  if(state._packStockCache[p.cardPackId] && state._packStockCache[p.cardPackId][productId]){  
+    state._packStockCache[p.cardPackId][productId].forceSoldOut = !before;  
+  }  
+  await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
   toast('변경되었습니다.','ok'); render();  
 };  
 window.deleteProduct = async function(productId, name){  
@@ -1961,8 +2162,10 @@ window.deleteProduct = async function(productId, name){
   try{  
     const before = {...state.products.find(x=>x.id===productId)};  
     await deleteDoc(doc(db,'products',productId));  
+    await updateDoc(doc(db,'packStocks',before.cardPackId), {[`stocks.${productId}`]: deleteField()}).catch(()=>{}); // packStocks에서도 제거  
     await addAuditLog('상품 삭제', productId, before, null);  
     state.products = state.products.filter(x=>x.id!==productId);  
+    await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
     toast('상품이 삭제되었습니다.','ok'); render();  
   }catch(e){  
     console.error('deleteProduct error', e);  
@@ -2060,6 +2263,8 @@ window.approveChargeRequest = async function(reqId, userUid, amount){
     await addAuditLog('충전 요청 승인', userUid, {coin:result.before}, {coin:result.after, amount});  
     // 재조회 없이 로컬 캐시만 갱신(read 절감)  
     if(state.users[userUid]) state.users[userUid] = {...state.users[userUid], coin:result.after};  
+    // onSnapshot이 없으므로, 관리자 자기 자신의 충전 요청을 승인한 경우 state.user도 함께 동기화한다  
+    if(state.user && state.user.uid===userUid) state.user.coin = result.after;  
     state.chargeRequests = state.chargeRequests.filter(x=>x.id!==reqId);  
     toast('충전이 승인되었습니다.','ok');  
     if(state._coinLedgersLoaded) loadAdminCoinLedgers(); else render();  
@@ -2194,6 +2399,7 @@ window.openNoticeForm = function(noticeId){
         await addAuditLog('공지 생성', ref.id, null, data);  
       }  
       await reloadNotices();  
+      await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공지도 공개 데이터라 캐시 버전을 올린다  
       closeModal(); toast('저장되었습니다.','ok'); render();  
     }catch(e){ toast('저장 중 오류가 발생했습니다.','err'); }  
   };  
@@ -2204,6 +2410,7 @@ window.toggleNoticeActive = async function(noticeId){
   await addAuditLog('공지 활성화토글', noticeId, null, {isActive: !n.isActive});  
   // 재조회 없이 로컬 캐시만 갱신(read 절감)  
   n.isActive = !n.isActive;  
+  await refreshPublicCacheAndBumpVersion(); // FIRESTORE READ OPTIMIZATION: 공개 데이터 캐시 버전 갱신  
   toast('변경되었습니다.','ok'); render();  
 };  
   
