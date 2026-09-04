@@ -1195,11 +1195,11 @@ window.doDraw = async function(count){
           // packStocks 문서 "1개"만 merge로 갱신한다(상품 수만큼 문서를 따로 쓰지 않는다).  
           // merge:true라서 문서가 아예 없던 경우/일부 상품만 시드되어 있던 경우  
           // 모두 안전하게 처리된다(없으면 새로 생성, 있으면 해당 필드만 갱신).  
-          const patch = {updatedAt: serverTimestamp()};  
+          const patch = {updatedAt: serverTimestamp(), stocks: {}};  
           Object.keys(stockDelta).forEach(pid=>{  
             const before = stocks[pid] ? stocks[pid].stock : (candidateProducts.find(p=>p.id===pid)?.currentStock || 0);  
             const forceSoldOut = stocks[pid] ? !!stocks[pid].forceSoldOut : false;  
-            patch[`stocks.${pid}`] = {stock: before - stockDelta[pid], forceSoldOut};  
+            patch.stocks[pid] = {stock: before - stockDelta[pid], forceSoldOut};  
           });  
           tx.set(stockRef, patch, {merge:true});  
   
@@ -2126,13 +2126,13 @@ window.openProductForm = function(productId, packId){
         await updateDoc(doc(db,'products',productId), {...data, currentStock:stock});  
         // FIRESTORE READ OPTIMIZATION: 뽑기는 packStocks만 보므로, 관리자가 재고를  
         // 수정하면 packStocks의 해당 상품 값도 함께 갱신해 실제 뽑기에도 반영되게 한다.  
-        await setDoc(doc(db,'packStocks',packId), {[`stocks.${productId}`]: {stock, forceSoldOut: before.forceSoldOut||false}, updatedAt:serverTimestamp()}, {merge:true});  
+        await setDoc(doc(db,'packStocks',packId), {stocks: {[productId]: {stock, forceSoldOut: before.forceSoldOut||false}}, updatedAt:serverTimestamp()}, {merge:true});  
         await addAuditLog('상품 수정', productId, before, data);  
       } else {  
         const newSortOrder = state.products.filter(x=>x.cardPackId===packId).length;  
         const ref = await addDoc(collection(db,'products'), {...data, cardPackId:packId, status:'ACTIVE', forceSoldOut:false, initialStock:stock, currentStock:stock, sortOrder:newSortOrder, createdAt:serverTimestamp(), createdAtKST:kstNow()});  
         // FIRESTORE READ OPTIMIZATION: 새 상품의 재고를 packStocks 문서에도 함께 시드한다  
-        await setDoc(doc(db,'packStocks',packId), {[`stocks.${ref.id}`]: {stock, forceSoldOut:false}, updatedAt:serverTimestamp()}, {merge:true});  
+        await setDoc(doc(db,'packStocks',packId), {stocks: {[ref.id]: {stock, forceSoldOut:false}}, updatedAt:serverTimestamp()}, {merge:true});  
         await addAuditLog('상품 생성', ref.id, null, data);  
       }  
       await reloadProducts();  
@@ -2147,7 +2147,7 @@ window.toggleForceSoldOut = async function(productId){
   const before = p.forceSoldOut;  
   await updateDoc(doc(db,'products',productId), {forceSoldOut: !before, updatedAt:serverTimestamp()});  
   // FIRESTORE READ OPTIMIZATION: 뽑기가 참조하는 packStocks에도 강제품절 여부를 함께 반영  
-  await setDoc(doc(db,'packStocks',p.cardPackId), {[`stocks.${productId}.forceSoldOut`]: !before}, {merge:true});  
+  await setDoc(doc(db,'packStocks',p.cardPackId), {stocks: {[productId]: {forceSoldOut: !before}}, updatedAt:serverTimestamp()}, {merge:true});  
   await addAuditLog('강제품절 토글', productId, {forceSoldOut:before}, {forceSoldOut:!before});  
   // 재조회 없이 로컬 캐시만 갱신(read 절감)  
   p.forceSoldOut = !before;  
