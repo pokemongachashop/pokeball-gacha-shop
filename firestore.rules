@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() { return request.auth != null; }
+    function isOwner(uid) { return isSignedIn() && request.auth.uid == uid; }
+
+    // 주의: isAdmin()은 users 문서를 get()으로 읽기 때문에 호출될 때마다 Read 1회가 과금됩니다.
+    // 그래서 아래 모든 규칙에서 "본인 확인"을 먼저 쓰고 isAdmin()은 맨 뒤에 둡니다.
+    // (앞 조건이 참이면 isAdmin()은 실행되지 않아 Read가 발생하지 않음)
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'ADMIN';
+    }
+
+    match /users/{uid} {
+      allow read: if isSignedIn();
+      allow create: if isOwner(uid);
+      allow update: if (isOwner(uid) &&
+         request.resource.data.role == resource.data.role &&
+         request.resource.data.uid == resource.data.uid &&
+         request.resource.data.loginId == resource.data.loginId)
+        || isAdmin();
+    }
+
+    match /usernames/{key} {
+      allow read: if true;
+      allow create, update, delete: if isSignedIn();
+    }
+
+    match /cardPacks/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    // 뽑기는 더 이상 products를 수정하지 않으므로(재고는 packStocks) 관리자만 쓰기 가능
+    match /products/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    // 카드팩 단위 재고 문서 (뽑기 트랜잭션이 갱신)
+    // isAdmin() 조건을 빼서 뽑기 1회마다 발생하던 추가 Read를 없앴습니다(관리자도 로그인 상태라 그대로 통과).
+    match /packStocks/{packId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    match /notices/{id} { allow read: if true; allow write: if isAdmin(); }
+    match /siteSettings/{id} { allow read: if true; allow write: if isAdmin(); }
+
+    match /coinLedgers/{id} {
+      allow read: if isSignedIn();
+      allow create: if (isSignedIn() &&
+          request.resource.data.uid == request.auth.uid &&
+          request.resource.data.type in ['DRAW','SELL'])
+        || isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    match /auditLogs/{id} { allow read, create: if isAdmin(); }
+
+    match /drawLogs/{id} {
+      allow read: if (isSignedIn() && resource.data.uid == request.auth.uid) || isAdmin();
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+    }
+
+    match /inventories/{uid}/items/{itemId} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid);
+      allow update: if (isOwner(uid) &&
+          request.resource.data.name == resource.data.name &&
+          request.resource.data.sellCoin == resource.data.sellCoin)
+        || isAdmin();
+      // [변경] 즉시판매/등급 일괄판매/SOLD 정리 시 본인 카드 삭제 허용
+      allow delete: if isOwner(uid) || isAdmin();
+    }
+
+    match /claimRequests/{claimId} {
+      allow read: if (isSignedIn() && resource.data.uid == request.auth.uid) || isAdmin();
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.itemId is string;
+      allow update: if isAdmin();
+      allow delete: if (isSignedIn() && resource.data.uid == request.auth.uid && resource.data.status == 'PENDING')
+        || isAdmin();
+    }
+
+    match /chargeRequests/{requestId} {
+      allow create: if isSignedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.status == 'PENDING'
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+      allow read: if isSignedIn()
+        && (resource.data.uid == request.auth.uid || isAdmin());
+      allow update, delete: if isAdmin();
+    }
+  }
+}
